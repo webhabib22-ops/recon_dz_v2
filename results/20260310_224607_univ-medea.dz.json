@@ -1,0 +1,16 @@
+{
+  "target": "univ-medea.dz",
+  "timestamp": "2026-03-10T22:46:07.585416",
+  "algerian_context": null,
+  "probe": {
+    "status": 0,
+    "server": "",
+    "technologies": []
+  },
+  "waf": null,
+  "endpoints": [],
+  "stats": {
+    "requests_total": 0,
+    "requests_success": 0
+  }
+}
