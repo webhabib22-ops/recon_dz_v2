@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 #!/usr/bin/env python3
 """
 RECON-DZ v2 - Advanced Security Reconnaissance Framework
@@ -52,7 +53,7 @@ class RECONDZv2:
         )
         
         await self.engine.initialize()
-        print("[âœ“] Engine ready\n")
+        print("[+] Engine ready\n")
         return self
     
     async def close(self):
@@ -80,7 +81,7 @@ class RECONDZv2:
         algeria_info = self.algeria_db.identify_target(target)
         
         if algeria_info:
-            print(f"[âœ“] Algerian infrastructure detected")
+            print(f"[+] Algerian infrastructure detected")
             print(f"    Sector: {algeria_info.sector.upper()}")
             print(f"    Criticality: {algeria_info.criticality.upper()}")
             print(f"    ISP: {algeria_info.isp}")
@@ -103,12 +104,12 @@ class RECONDZv2:
         )
         
         if response.status == 0:
-            print(f"[âœ—] Target unreachable")
+            print(f"[-] Target unreachable")
             print(f"    Error: {response.error}")
             return {'error': 'unreachable', 'details': response.error}
         
         base_url = f"{protocol}{actual_target}"
-        print(f"[âœ“] Connected: {base_url}")
+        print(f"[+] Connected: {base_url}")
         print(f"    Status: {response.status}")
         print(f"    Server: {response.get_header('server', 'Unknown')}")
         print(f"    Response Time: {response.elapsed:.2f}s")
@@ -118,20 +119,20 @@ class RECONDZv2:
         
         techs = response.extract_technology_hints()
         if techs:
-            print("[âœ“] Detected technologies:")
+            print("[+] Detected technologies:")
             for tech in techs:
-                print(f"    â€¢ {tech}")
+                print(f"    * {tech}")
         else:
             print("[!] No clear technology indicators")
         
         # WAF Detection
-        waf = await detect_waf_response(response)
+        waf = detect_waf_response(response)
         if waf:
-            print(f"[âš ] WAF/Protection: {waf}")
+            print(f"[!] WAF/Protection: {waf}")
             if self.internal_mode:
                 print("[*] Internal mode active - WAF evasion enabled")
         else:
-            print("[âœ“] No WAF detected")
+            print("[+] No WAF detected")
         
         # Phase 4: Discovery
         print("\n[Phase 4/5] Endpoint Discovery")
@@ -155,7 +156,7 @@ class RECONDZv2:
                 }
                 discovered.append(endpoint)
                 
-                status_icon = "âœ“" if resp.is_success else "âš "
+                status_icon = "[+]" if resp.is_success else "[!]"
                 title_str = f" - {endpoint['title'][:40]}" if endpoint.get('title') else ""
                 print(f"    [{status_icon}] {resp.status} {resp.url}{title_str}")
             
@@ -169,9 +170,9 @@ class RECONDZv2:
         findings = self._analyze_findings(response, discovered, algeria_info)
         
         if findings:
-            print(f"[âœ“] {len(findings)} security observations")
+            print(f"[+] {len(findings)} security observations")
             for finding in findings[:5]:
-                print(f"    â€¢ [{finding['severity']}] {finding['name']}")
+                print(f"    * [{finding['severity']}] {finding['name']}")
         else:
             print("[*] No immediate security concerns")
         
@@ -300,8 +301,9 @@ class RECONDZv2:
                 findings.append({
                     'name': 'Decree 26-07 Violation: No HSTS',
                     'severity': 'high',
-                    'detail': 'Missing HTTPS enforcement',
+                    'detail': 'Missing HTTPS enforcement (Strict-Transport-Security header)',
                     'compliance': 'Decree_26_07_Article_12',
+                    'recommendation': 'Add: Strict-Transport-Security: max-age=31536000; includeSubDomains',
                 })
         
         return findings
@@ -317,13 +319,13 @@ class RECONDZv2:
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(self.results, f, indent=2, ensure_ascii=False, default=str)
         
-        print(f"\n[âœ“] Report saved: {filepath}")
+        print(f"\n[+] Report saved: {filepath}")
         
         # Also save text summary
         txt_file = filepath.with_suffix('.txt')
         with open(txt_file, 'w', encoding='utf-8') as f:
             f.write(self._generate_text_report())
-        print(f"[âœ“] Summary saved: {txt_file}")
+        print(f"[+] Summary saved: {txt_file}")
     
     def _generate_text_report(self) -> str:
         """Generate text report"""
@@ -379,11 +381,11 @@ class RECONDZv2:
         print(f"Target: {self.results['target']['input']}")
         
         if algeria_info:
-            print(f"Algerian: âœ“ YES")
+            print(f"Algerian: [+] YES")
             print(f"  Sector: {algeria_info.sector}")
             print(f"  Criticality: {algeria_info.criticality}")
         else:
-            print(f"Algerian: âœ— NO")
+            print(f"Algerian: [-] NO")
         
         print(f"Status: {response.status}")
         print(f"Endpoints: {len(discovered)}")
