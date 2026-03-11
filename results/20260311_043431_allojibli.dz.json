@@ -1,0 +1,127 @@
+{
+  "framework": {
+    "version": "2.0.0",
+    "session": "20260311_043431",
+    "license": "Authorized Security Assessment Only"
+  },
+  "target": {
+    "input": "allojibli.dz",
+    "resolved": "www.allojibli.dz",
+    "protocol": "https://"
+  },
+  "algerian_context": {
+    "domain": "allojibli.dz",
+    "ip": null,
+    "sector": "unknown",
+    "criticality": "medium",
+    "isp": "unknown",
+    "city": null,
+    "compliance_requirements": [],
+    "common_vulnerabilities": [
+      "missing_security_headers",
+      "weak_authentication",
+      "information_disclosure",
+      "outdated_cms"
+    ],
+    "threat_actors": [],
+    "recommended_tests": [
+      "subdomain_enumeration",
+      "technology_fingerprinting",
+      "ssl_tls_analysis",
+      "security_headers",
+      "exposed_endpoints"
+    ],
+    "is_government": false,
+    "is_education": false,
+    "is_banking": false,
+    "is_telecom": false,
+    "is_energy": false,
+    "is_health": false,
+    "is_media": false,
+    "asn": null,
+    "ip_range": null
+  },
+  "connection": {
+    "status": 200,
+    "time": 0.08893099008128047,
+    "server": "",
+    "powered_by": ""
+  },
+  "technologies": [],
+  "protection": {
+    "waf": null,
+    "internal_mode": false
+  },
+  "discovery": {
+    "tested": 7,
+    "found": 0,
+    "endpoints": []
+  },
+  "findings": [
+    {
+      "name": "Missing Security Headers",
+      "severity": "medium",
+      "detail": "Missing: x-frame-options, x-content-type-options, content-security-policy, strict-transport-security",
+      "recommendation": "Implement security headers"
+    }
+  ],
+  "statistics": {
+    "requests_total": 5,
+    "requests_success": 2,
+    "requests_failed": 20
+  },
+  "timestamp": "2026-03-11T04:34:42.642523",
+  "ip_enumeration": {
+    "real_ip": "157.90.129.171",
+    "domains_found": 6,
+    "active_domains": 4,
+    "domains": [
+      {
+        "domain": "webmail.makemake.dzs.cloud",
+        "active": false,
+        "error": "Cannot connect to host www.webmail.makemake.dzs.cloud:80 ssl:False [Could not contact DNS servers]"
+      },
+      {
+        "domain": "makemake.dzs.cloud",
+        "active": true,
+        "status": 404,
+        "server": "",
+        "title": "404 Not Found",
+        "ip": "157.90.129.171",
+        "algerian_context": null
+      },
+      {
+        "domain": "uranus-shared.dzsecurity.net",
+        "active": true,
+        "status": 404,
+        "server": "",
+        "title": "404 Not Found",
+        "ip": "157.90.129.171",
+        "algerian_context": null
+      },
+      {
+        "domain": "cpanel.makemake.dzs.cloud",
+        "active": false,
+        "error": "Cannot connect to host www.cpanel.makemake.dzs.cloud:80 ssl:False [Could not contact DNS servers]"
+      },
+      {
+        "domain": "eris-shared.dzsecurity.net",
+        "active": true,
+        "status": 404,
+        "server": "",
+        "title": "404 Not Found",
+        "ip": "157.90.129.171",
+        "algerian_context": null
+      },
+      {
+        "domain": "makemake-shared.dzsecurity.net",
+        "active": true,
+        "status": 200,
+        "server": "",
+        "title": null,
+        "ip": "157.90.129.171",
+        "algerian_context": null
+      }
+    ]
+  }
+}
