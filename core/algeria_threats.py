@@ -311,15 +311,60 @@ class AlgeriaThreatDatabase:
                     break
             if sector != 'unknown':
                 break
-        
+
+        # â”€â”€ ØªØ­Ø¯ÙŠØ¯ Ø°ÙƒÙŠ Ù„Ù„Ù€ sector Ø¥Ø°Ø§ Ø¨Ù‚ÙŠ unknown â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        if sector == 'unknown':
+            # ØªØ¬Ø§Ø±Ø© Ø¥Ù„ÙƒØªØ±ÙˆÙ†ÙŠØ© / Ø®Ø¯Ù…Ø§Øª
+            if any(x in target_lower for x in [
+                'shop', 'store', 'market', 'sell', 'buy', 'boutique',
+                'delivery', 'livraison', 'commerce', 'vente', 'dz$',
+                'app', 'service', 'tech', 'digital', 'soft', 'dev',
+            ]):
+                sector = 'commercial'
+                sector_data = {
+                    'criticality': 'medium',
+                    'compliance': [],
+                    'common_vulns': [
+                        'exposed_customer_data', 'weak_authentication',
+                        'payment_security', 'api_security_flaws',
+                        'missing_security_headers',
+                    ],
+                    'threat_actors': ['Credential_stuffing', 'Skimming_groups'],
+                }
+            # Ø§Ø³ØªØ¶Ø§ÙØ© / Ø´Ø±ÙƒØ§Øª
+            elif any(x in target_lower for x in [
+                'host', 'server', 'cloud', 'vps', 'web', 'net', 'it-',
+            ]):
+                sector = 'hosting'
+                sector_data = {
+                    'criticality': 'high',
+                    'compliance': [],
+                    'common_vulns': [
+                        'shared_hosting_risks', 'server_misconfiguration',
+                        'exposed_cpanel', 'weak_ftp',
+                    ],
+                    'threat_actors': ['Mass_scanners'],
+                }
+            else:
+                # unknown Ù„ÙƒÙ† .dz â€” Ø§Ø¹Ø·Ù‡ Ù‚ÙŠÙ… Ø§ÙØªØ±Ø§Ø¶ÙŠØ© Ù…Ø¹Ù‚ÙˆÙ„Ø©
+                sector_data = {
+                    'criticality': 'medium',
+                    'compliance': [],
+                    'common_vulns': [
+                        'missing_security_headers', 'weak_authentication',
+                        'information_disclosure', 'outdated_cms',
+                    ],
+                    'threat_actors': [],
+                }
+
         # Determine criticality
         criticality = 'low'
         if sector in ['government', 'banking', 'energy']:
             criticality = 'critical' if any(x in target_lower for x in 
                 ['presidence', 'bank-of-algeria', 'sonatrach', 'defense']) else 'high'
-        elif sector in ['telecom', 'health']:
+        elif sector in ['telecom', 'health', 'hosting']:
             criticality = 'high'
-        elif sector in ['education', 'media']:
+        elif sector in ['education', 'media', 'commercial', 'unknown']:
             criticality = 'medium'
         
         # Build compliance list

@@ -187,7 +187,7 @@ class AsyncReconEngine:
         
         self.semaphore = asyncio.Semaphore(self.max_concurrent)
         
-        print("[âœ“] Engine ready with DoH support")
+        print("[+] Engine ready with DoH support")
         return self
     
     async def close(self):

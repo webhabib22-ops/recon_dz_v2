@@ -146,21 +146,45 @@ class RECONDZv2:
         for i, url in enumerate(urls, 1):
             resp = await self.engine.request(url)
             
-            if resp.is_success or resp.status == 403:
+            # Ù‚Ø¨ÙˆÙ„ Ø£ÙŠ Ø±Ø¯ Ù„ÙŠØ³ Ø®Ø·Ø£ Ø´Ø¨ÙƒØ© (0) ÙˆÙ„ÙŠØ³ timeout
+            # 200/301/302/403/401 ÙƒÙ„Ù‡Ø§ Ù…Ø¹Ù„ÙˆÙ…Ø§Øª Ù…ÙÙŠØ¯Ø©
+            if resp.status != 0:
                 endpoint = {
-                    'url': resp.url,
+                    'url':    url,
                     'status': resp.status,
-                    'size': len(resp.body),
-                    'title': self._extract_title(resp.body),
+                    'size':   len(resp.body),
+                    'title':  self._extract_title(resp.body),
                     'server': resp.get_header('server'),
+                    'redirect_to': resp.final_url if resp.final_url != url else '',
                 }
-                discovered.append(endpoint)
-                
-                status_icon = "[+]" if resp.is_success else "[!]"
-                title_str = f" - {endpoint['title'][:40]}" if endpoint.get('title') else ""
-                print(f"    [{status_icon}] {resp.status} {resp.url}{title_str}")
+
+                # Ø£Ø¶Ù ÙÙ‚Ø· Ø§Ù„Ø±Ø¯ÙˆØ¯ Ø§Ù„Ù…Ø«ÙŠØ±Ø© Ù„Ù„Ø§Ù‡ØªÙ…Ø§Ù…
+                interesting = (
+                    resp.is_success or                        # 200-299
+                    resp.status in (301, 302, 307, 308) or    # redirects
+                    resp.status in (401, 403) or              # auth required = Ù…ÙˆØ¬ÙˆØ¯
+                    (resp.status == 404 and len(resp.body) > 500)  # 404 Ù…Ø®ØµØµ = framework
+                )
+
+                if interesting:
+                    discovered.append(endpoint)
+
+                # Ø·Ø¨Ø§Ø¹Ø© ÙÙˆØ±ÙŠØ© Ù„ÙƒÙ„ Ø±Ø¯ Ù…Ø«ÙŠØ±
+                if resp.status in (200, 201, 301, 302, 401, 403):
+                    if resp.status == 200:
+                        icon = "[+]"
+                    elif resp.status in (301, 302):
+                        icon = "[>]"
+                    elif resp.status in (401, 403):
+                        icon = "[!]"
+                    else:
+                        icon = "[*]"
+                    
+                    title_str = f" \"{endpoint['title'][:35]}\"" if endpoint.get('title') else ""
+                    redir_str = f" -> {endpoint['redirect_to'][:40]}" if endpoint.get('redirect_to') else ""
+                    print(f"    {icon} [{resp.status}] {url}{title_str}{redir_str}")
             
-            if i % 10 == 0:
+            if i % 10 == 0 and i < len(urls):
                 print(f"    Progress: {i}/{len(urls)}")
         
         # Phase 5: Analysis
