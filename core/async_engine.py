@@ -143,8 +143,14 @@ class DNSResolver:
 class AsyncReconEngine:
     """Professional async engine with DoH support"""
     
-    def __init__(self, max_concurrent: int = 20):
+    def __init__(self, max_concurrent: int = 20,
+                 enable_stealth: bool = False,
+                 internal_mode: bool = False,
+                 delay_range: tuple = (0.0, 0.0)):
         self.max_concurrent = max_concurrent
+        self.enable_stealth = enable_stealth
+        self.internal_mode  = internal_mode
+        self.delay_range    = delay_range          # (min, max) seconds between requests
         self.session: Optional[aiohttp.ClientSession] = None
         self.dns_resolver: Optional[DNSResolver] = None
         self.semaphore: Optional[asyncio.Semaphore] = None
@@ -181,7 +187,7 @@ class AsyncReconEngine:
         
         self.semaphore = asyncio.Semaphore(self.max_concurrent)
         
-        print("[✓] Engine ready with DoH support")
+        print("[âœ“] Engine ready with DoH support")
         return self
     
     async def close(self):
@@ -198,6 +204,11 @@ class AsyncReconEngine:
     async def request(self, url: str, method: str = 'GET') -> ResponseData:
         """Make HTTP request with full handling"""
         async with self.semaphore:
+            # ØªØ·Ø¨ÙŠÙ‚ Ø§Ù„ØªØ£Ø®ÙŠØ± Ø¥Ø°Ø§ ÙƒØ§Ù† stealth mode Ù…ÙØ¹Ù‘Ù„Ø§Ù‹
+            if self.delay_range and self.delay_range[1] > 0:
+                delay = random.uniform(self.delay_range[0], self.delay_range[1])
+                await asyncio.sleep(delay)
+
             start = time.perf_counter()
             
             try:
@@ -284,4 +295,187 @@ class AsyncReconEngine:
         
         # Update URL in response to show original hostname
         if response.status != 0:
-            response.final_url = f"{'https' if url.startswith
+            proto = 'https' if url.startswith('https') else 'http'
+            response.final_url = f"{proto}://{hostname}{path}"
+            response.protocol  = proto
+
+        return response
+
+    async def _request_with_host(self, url: str,
+                                  extra_headers: Dict[str, str]) -> ResponseData:
+        """Make request with custom Host header (for IP-based requests)"""
+        async with self.semaphore:
+            start = time.perf_counter()
+            try:
+                merged_headers = {
+                    'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                                       'AppleWebKit/537.36 (KHTML, like Gecko) '
+                                       'Chrome/124.0.0.0 Safari/537.36',
+                    'Accept':          'text/html,application/xhtml+xml,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Connection':      'keep-alive',
+                }
+                merged_headers.update(extra_headers)
+
+                async with self.session.request(
+                    method='GET',
+                    url=url,
+                    headers=merged_headers,
+                    ssl=False,
+                    allow_redirects=True,
+                ) as resp:
+                    body_bytes = await resp.read()
+                    elapsed    = time.perf_counter() - start
+
+                    try:
+                        body    = body_bytes.decode('utf-8')
+                        charset = 'utf-8'
+                    except Exception:
+                        body    = body_bytes.decode('latin-1', errors='ignore')
+                        charset = 'latin-1'
+
+                    self.stats['requests_total'] += 1
+                    if resp.status < 400:
+                        self.stats['requests_success'] += 1
+                    else:
+                        self.stats['requests_failed'] += 1
+
+                    return ResponseData(
+                        url=url,
+                        status=resp.status,
+                        headers=dict(resp.headers),
+                        body=body[:100_000],
+                        body_bytes=body_bytes,
+                        content_type=resp.headers.get('Content-Type', ''),
+                        charset=charset,
+                        elapsed=elapsed,
+                        final_url=str(resp.url),
+                        redirect_count=len(resp.history),
+                        protocol='https' if url.startswith('https') else 'http',
+                    )
+
+            except Exception as exc:
+                self.stats['requests_failed'] += 1
+                return ResponseData(
+                    url=url, status=0, headers={}, body='', body_bytes=b'',
+                    content_type='', charset='',
+                    elapsed=time.perf_counter() - start,
+                    final_url=url, redirect_count=0,
+                    error=str(exc),
+                    protocol='https' if url.startswith('https') else 'http',
+                )
+
+    async def request_with_fallback(self, hostname: str,
+                                     www_fallback: bool = True,
+                                     path: str = '/') -> tuple:
+        """
+        ÙŠØ­Ø§ÙˆÙ„ Ø§Ù„Ø§ØªØµØ§Ù„ Ø¨Ø§Ù„Ù‡Ø¯Ù Ø¨ÙƒÙ„ Ø§Ù„Ø·Ø±Ù‚ Ø§Ù„Ù…Ù…ÙƒÙ†Ø©:
+        https://hostname â†’ http://hostname â†’ https://www.hostname â†’ http://www.hostname
+
+        ÙŠØ±Ø¬Ø¹: (ResponseData, protocol_str, actual_hostname)
+        Ù…Ø«Ø§Ù„: (resp, 'https://', 'www.example.com')
+        """
+        candidates = []
+        for proto in ['https://', 'http://']:
+            candidates.append((proto, hostname))
+            if www_fallback and not hostname.startswith('www.'):
+                candidates.append((proto, f'www.{hostname}'))
+
+        last_response = None
+        for proto, host in candidates:
+            url  = f"{proto}{host}{path}"
+            resp = await self.request(url)
+            last_response = resp
+            if resp.status != 0 and resp.status < 500:
+                return (resp, proto, host)
+
+        # ÙƒÙ„ Ø§Ù„Ù…Ø­Ø§ÙˆÙ„Ø§Øª ÙØ´Ù„Øª
+        return (last_response, 'https://', hostname)
+
+    async def batch_request(self, urls: List[str],
+                             method: str = 'GET') -> List[ResponseData]:
+        """
+        ÙŠØ±Ø³Ù„ Ø¹Ø¯Ø© Ø·Ù„Ø¨Ø§Øª Ø¨Ø´ÙƒÙ„ Ù…ØªÙˆØ§Ø²Ù ÙˆÙŠØ±Ø¬Ø¹ Ø§Ù„Ù†ØªØ§Ø¦Ø¬ Ù…Ø±ØªØ¨Ø© Ø¨Ù†ÙØ³ Ø§Ù„ØªØ±ØªÙŠØ¨.
+        """
+        tasks = [self.request(url, method) for url in urls]
+        return await asyncio.gather(*tasks, return_exceptions=False)
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Ø¥Ø±Ø¬Ø§Ø¹ Ø¥Ø­ØµØ§Ø¡Ø§Øª Ø§Ù„Ø¬Ù„Ø³Ø©"""
+        total = self.stats['requests_total']
+        if total:
+            success_rate = round(
+                self.stats['requests_success'] / total * 100, 1
+            )
+        else:
+            success_rate = 0.0
+        return {**self.stats, 'success_rate_pct': success_rate}
+
+
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+#  Ø¯Ø§Ù„Ø© Ù…Ø³Ø§Ø¹Ø¯Ø©: ØªØ´ØºÙŠÙ„ async Ù…Ù† ÙƒÙˆØ¯ Ø¹Ø§Ø¯ÙŠ (sync)
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+def run_async(coro):
+    """
+    ØªØ´ØºÙŠÙ„ coroutine Ù…Ù† ÙƒÙˆØ¯ synchronous.
+    Ù…ÙÙŠØ¯ Ù„ØªØ¬Ø±Ø¨Ø© Ø§Ù„Ù…Ø­Ø±Ùƒ Ø¨Ø´ÙƒÙ„ Ù…Ø¨Ø§Ø´Ø±.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, coro)
+                return future.result()
+        else:
+            return loop.run_until_complete(coro)
+    except RuntimeError:
+        return asyncio.run(coro)
+
+
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+#  WAF Detection Helper (Ù…Ø³ØªØ®Ø¯Ù… Ù…Ù† recon_dz_v2.py)
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+def detect_waf_response(response: ResponseData) -> Optional[str]:
+    """
+    ÙŠÙƒØ´Ù ÙˆØ¬ÙˆØ¯ WAF Ù…Ù† Ø§Ù„Ø±Ø¯.
+    ÙŠØ±Ø¬Ø¹ Ø§Ø³Ù… Ø§Ù„Ù€ WAF Ø£Ùˆ None.
+    """
+    if not response or response.status == 0:
+        return None
+
+    body_lower  = response.body.lower()
+    headers     = {k.lower(): v.lower() for k, v in response.headers.items()}
+
+    waf_signatures = {
+        'Cloudflare':  ['cloudflare', '__cfduid', 'cf-ray'],
+        'AWS WAF':     ['awswaf', 'aws-waf'],
+        'Imperva':     ['incapsula', 'visid_incap', 'incap_ses'],
+        'Akamai':      ['akamai', 'akamaierror'],
+        'F5 BIG-IP':   ['bigip', 'f5-'],
+        'Sucuri':      ['sucuri', 'x-sucuri-id'],
+        'ModSecurity': ['mod_security', 'modsecurity'],
+        'Fortinet':    ['fortigate', 'fortiwan'],
+        'Barracuda':   ['barracuda'],
+        'Nginx WAF':   ['naxsi'],
+    }
+
+    # ÙØ­Øµ headers
+    for waf_name, sigs in waf_signatures.items():
+        for sig in sigs:
+            for hdr_val in headers.values():
+                if sig in hdr_val:
+                    return waf_name
+            if sig in body_lower:
+                return waf_name
+
+    # ÙØ­Øµ status 403 Ù…Ø¹ Ø±Ø³Ø§Ø¦Ù„ Ø®Ø§ØµØ©
+    if response.status in (403, 406, 429, 503):
+        for waf_name, sigs in waf_signatures.items():
+            for sig in sigs:
+                if sig in body_lower:
+                    return waf_name
+
+    return None
