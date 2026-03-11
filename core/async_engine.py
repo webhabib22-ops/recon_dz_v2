@@ -369,28 +369,52 @@ class AsyncReconEngine:
                                      www_fallback: bool = True,
                                      path: str = '/') -> tuple:
         """
-        ÙŠØ­Ø§ÙˆÙ„ Ø§Ù„Ø§ØªØµØ§Ù„ Ø¨Ø§Ù„Ù‡Ø¯Ù Ø¨ÙƒÙ„ Ø§Ù„Ø·Ø±Ù‚ Ø§Ù„Ù…Ù…ÙƒÙ†Ø©:
-        https://hostname â†’ http://hostname â†’ https://www.hostname â†’ http://www.hostname
-
+        ÙŠØ­Ø§ÙˆÙ„ Ø§Ù„Ø§ØªØµØ§Ù„ Ø¨Ø§Ù„Ù‡Ø¯Ù Ø¨ÙƒÙ„ Ø§Ù„Ø·Ø±Ù‚ Ø§Ù„Ù…Ù…ÙƒÙ†Ø© Ù…Ø¹ DoH resolution:
+        1. ÙŠØ­Ù„ DNS Ø¹Ø¨Ø± DoH Ø£ÙˆÙ„Ø§Ù‹ (ÙŠØªØ¬Ø§ÙˆØ² Ø­Ø¬Ø¨ DNS)
+        2. ÙŠØ¬Ø±Ø¨ https â†’ http â†’ www.https â†’ www.http
         ÙŠØ±Ø¬Ø¹: (ResponseData, protocol_str, actual_hostname)
-        Ù…Ø«Ø§Ù„: (resp, 'https://', 'www.example.com')
         """
-        candidates = []
-        for proto in ['https://', 'http://']:
-            candidates.append((proto, hostname))
-            if www_fallback and not hostname.startswith('www.'):
-                candidates.append((proto, f'www.{hostname}'))
+        # Ø¨Ù†Ø§Ø¡ Ù‚Ø§Ø¦Ù…Ø© Ø§Ù„Ù…Ø¶ÙŠÙÙŠÙ† Ù„Ù„ØªØ¬Ø±Ø¨Ø©
+        hostnames_to_try = [hostname]
+        if www_fallback and not hostname.startswith('www.'):
+            hostnames_to_try.append(f'www.{hostname}')
 
         last_response = None
-        for proto, host in candidates:
-            url  = f"{proto}{host}{path}"
-            resp = await self.request(url)
-            last_response = resp
-            if resp.status != 0 and resp.status < 500:
-                return (resp, proto, host)
+
+        for host in hostnames_to_try:
+            # â”€â”€ Ø§Ù„Ø®Ø·ÙˆØ© 1: Ø­Ù„ DNS Ø¹Ø¨Ø± DoH (ÙŠØªØ¬Ø§ÙˆØ² Ø­Ø¬Ø¨ Termux/DZ) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            ip = await self.resolve_hostname(host)
+
+            for proto in ['https://', 'http://']:
+                if ip:
+                    # Ø§ØªØµÙ„ Ø¨Ø§Ù„Ù€ IP Ù…Ø¨Ø§Ø´Ø±Ø© Ù…Ø¹ Host header â†’ ÙŠØªØ¬Ø§ÙˆØ² DNS ØªÙ…Ø§Ù…Ø§Ù‹
+                    port = '443' if proto == 'https://' else '80'
+                    url  = f"{proto}{ip}{path}"
+                    resp = await self._request_with_host(
+                        url, extra_headers={'Host': host}
+                    )
+                else:
+                    # DoH ÙØ´Ù„ â€” Ø¬Ø±Ù‘Ø¨ URL Ù…Ø¨Ø§Ø´Ø±Ø© ÙƒÙ…Ù„Ø§Ø° Ø£Ø®ÙŠØ±
+                    url  = f"{proto}{host}{path}"
+                    resp = await self.request(url)
+
+                last_response = resp
+
+                if resp.status != 0 and resp.status < 500:
+                    # ØµØ­Ù‘Ø­ Ø§Ù„Ù€ URL Ù„ÙŠØ¸Ù‡Ø± hostname Ø¨Ø¯Ù„ IP
+                    resp.final_url = f"{proto}{host}{path}"
+                    return (resp, proto, host)
 
         # ÙƒÙ„ Ø§Ù„Ù…Ø­Ø§ÙˆÙ„Ø§Øª ÙØ´Ù„Øª
-        return (last_response, 'https://', hostname)
+        error_resp = last_response or ResponseData(
+            url=f"https://{hostname}{path}",
+            status=0, headers={}, body='', body_bytes=b'',
+            content_type='', charset='', elapsed=0.0,
+            final_url=f"https://{hostname}{path}", redirect_count=0,
+            error="All connection attempts failed (DNS + DoH + direct)",
+            protocol='https',
+        )
+        return (error_resp, 'https://', hostname)
 
     async def batch_request(self, urls: List[str],
                              method: str = 'GET') -> List[ResponseData]:
