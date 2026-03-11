@@ -9,6 +9,7 @@ import ipaddress
 from typing import Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
+from datetime import datetime
 
 
 @dataclass
@@ -133,7 +134,7 @@ class AlgeriaThreatDatabase:
             'patterns': [
                 'chs.dz', 'hopital', 'hospital', 'sante.gov.dz',
                 'ministere-sante', 'health', 'medical', 'clinique',
-                'eph-', 'epsp-', 'santé', 'pharmacy', 'medicament',
+                'eph-', 'epsp-', 'santÃ©', 'pharmacy', 'medicament',
             ],
             'criticality': 'high',
             'compliance': ['Health_Data_Protection', 'Decree_26_07'],
