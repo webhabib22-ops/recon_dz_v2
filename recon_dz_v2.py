@@ -7,7 +7,7 @@ Educational and defensive purposes only
 
 Author: RECON-DZ Team
 License: Authorized Use Only - Government & Educational
-Version: 2.0.0 (Ultimate Edition)
+Version: 2.0.0 (Ultimate Edition - Fixed)
 """
 
 import asyncio
@@ -92,7 +92,9 @@ class RECONDZv2:
         print(f"{'='*60}\n")
 
         # Phase 1: Intelligence
-        print("[Phase 1/8] Intelligence Gathering")
+        phase_current = 1
+        total_phases = 1  # سنقوم بحسابها لاحقاً
+        print(f"[Phase {phase_current}/?] Intelligence Gathering")
         algeria_info = self.algeria_db.identify_target(target)
 
         if algeria_info:
@@ -110,7 +112,8 @@ class RECONDZv2:
             print("[!] Non-Algerian target (general scan mode)")
 
         # Phase 2: Connectivity
-        print("\n[Phase 2/8] Connectivity Assessment")
+        phase_current += 1
+        print(f"\n[Phase {phase_current}/?] Connectivity Assessment")
 
         response, protocol, actual_target = await self.engine.request_with_fallback(
             target, www_fallback=True
@@ -128,7 +131,8 @@ class RECONDZv2:
         print(f"    Response Time: {response.elapsed:.2f}s")
 
         # Phase 3: Technology Analysis
-        print("\n[Phase 3/8] Technology Analysis")
+        phase_current += 1
+        print(f"\n[Phase {phase_current}/?] Technology Analysis")
 
         techs = response.extract_technology_hints()
         if techs:
@@ -146,12 +150,17 @@ class RECONDZv2:
         else:
             print("[+] No WAF detected")
 
-        # Phase 4: IP & Domain Enumeration (reverse IP)
+        # نحتاج IP الهدف لعدة مراحل قادمة
+        target_ip = None
+
+        # Phase 4: IP & Domain Enumeration (reverse IP) - اختياري
         ip_enum_data = None
         if self.enumerate_domains:
-            print("\n[Phase 4/8] Reverse IP Enumeration")
+            phase_current += 1
+            print(f"\n[Phase {phase_current}/?] Reverse IP Enumeration")
             real_ip = await extract_real_ip(actual_target, self.engine)
             if real_ip:
+                target_ip = real_ip  # نأخذه للتعداد العكسي وللمراحل الأخرى
                 print(f"[+] Real server IP: {real_ip}")
                 enumerator = IPEnumerator(self.engine)
                 domains = await enumerator.enumerate(real_ip)
@@ -176,10 +185,19 @@ class RECONDZv2:
             else:
                 print("[-] Could not determine real IP")
 
-        # Phase 5: Subdomain Enumeration (if requested)
+        # إذا لم نحصل على IP من التعداد العكسي، نحاول الحصول عليه الآن لاستخدامه في المراحل التالية
+        if not target_ip:
+            # محاولة استخراج IP حقيقي (حتى خلف CDN)
+            target_ip = await extract_real_ip(actual_target, self.engine)
+            if not target_ip:
+                # آخر حل: استخدام DoH العادي
+                target_ip = await self.engine.resolve_hostname(actual_target)
+
+        # Phase 5: Subdomain Enumeration (اختياري)
         subdomain_data = None
         if self.enumerate_subdomains:
-            print("\n[Phase 5/8] Subdomain Enumeration")
+            phase_current += 1
+            print(f"\n[Phase {phase_current}/?] Subdomain Enumeration")
             sub_enum = SubdomainEnumerator(self.engine, self.algeria_db)
             subs = await sub_enum.enumerate(actual_target, concurrency=50)
             print(f"[+] Discovered {len(subs)} active subdomains")
@@ -192,27 +210,31 @@ class RECONDZv2:
                 'subdomains': subs
             }
 
-        # Phase 6: Port Scanning (if requested)
+        # Phase 6: Port Scanning (اختياري)
         port_data = None
-        if self.scan_ports and ip_enum_data and ip_enum_data.get('real_ip'):
-            print("\n[Phase 6/8] Port Scanning")
-            scanner = PortScanner(timeout=2.0, max_concurrent=100)
-            real_ip = ip_enum_data['real_ip']
-            open_ports = await scanner.scan(real_ip)
-            print(f"[+] Open ports: {len(open_ports)}")
-            for p in open_ports[:20]:
-                svc = p.service or 'unknown'
-                banner = f" - {p.banner}" if p.banner else ''
-                print(f"    * {p.port}/tcp {svc}{banner}")
-            port_data = {
-                'real_ip': real_ip,
-                'open_ports': [{'port': p.port, 'service': p.service, 'banner': p.banner} for p in open_ports]
-            }
+        if self.scan_ports:
+            phase_current += 1
+            print(f"\n[Phase {phase_current}/?] Port Scanning")
+            if target_ip:
+                scanner = PortScanner(timeout=2.0, max_concurrent=100)
+                open_ports = await scanner.scan(target_ip)
+                print(f"[+] Open ports: {len(open_ports)}")
+                for p in open_ports[:20]:
+                    svc = p.service or 'unknown'
+                    banner = f" - {p.banner}" if p.banner else ''
+                    print(f"    * {p.port}/tcp {svc}{banner}")
+                port_data = {
+                    'real_ip': target_ip,
+                    'open_ports': [{'port': p.port, 'service': p.service, 'banner': p.banner} for p in open_ports]
+                }
+            else:
+                print("[-] Could not determine target IP for port scanning")
 
-        # Phase 7: CMS Detection (if requested)
+        # Phase 7: CMS Detection (اختياري)
         cms_data = None
         if self.detect_cms:
-            print("\n[Phase 7/8] CMS Detection")
+            phase_current += 1
+            print(f"\n[Phase {phase_current}/?] CMS Detection")
             detector = CMSDetector()
             cms_list = await detector.detect(base_url, self.engine)
             if cms_list:
@@ -224,12 +246,13 @@ class RECONDZv2:
             else:
                 print("[!] No CMS detected")
 
-        # Phase 8: Server Fingerprinting (if requested)
+        # Phase 8: Server Fingerprinting (اختياري)
         fingerprint_data = None
         if self.fingerprint and port_data:
-            print("\n[Phase 8/8] Server Fingerprinting")
+            phase_current += 1
+            print(f"\n[Phase {phase_current}/?] Server Fingerprinting")
             fingerprinter = ServerFingerprinter(self.engine)
-            fp = await fingerprinter.fingerprint(ip_enum_data['real_ip'], port_data['open_ports'])
+            fp = await fingerprinter.fingerprint(target_ip, port_data['open_ports'])
             print(f"[+] OS Guess: {fp.get('os', 'Unknown')}")
             if fp.get('technologies'):
                 print("[+] Technologies:")
@@ -237,8 +260,9 @@ class RECONDZv2:
                     print(f"    * {t['name']}")
             fingerprint_data = fp
 
-        # Phase 9: Endpoint Discovery (original)
-        print("\n[Phase 9/8] Endpoint Discovery")
+        # Phase 9: Endpoint Discovery (دائم)
+        phase_current += 1
+        print(f"\n[Phase {phase_current}/?] Endpoint Discovery")
         paths = self._get_discovery_paths(algeria_info)
         urls = [f"{base_url.rstrip('/')}{path}" for path in paths]
         print(f"[*] Testing {len(urls)} endpoints...")
@@ -274,7 +298,8 @@ class RECONDZv2:
                 print(f"    Progress: {i}/{len(urls)}")
 
         # Phase 10: Security Analysis
-        print("\n[Phase 10/8] Security Analysis")
+        phase_current += 1
+        print(f"\n[Phase {phase_current}/?] Security Analysis")
         findings = self._analyze_findings(response, discovered, algeria_info)
         if findings:
             print(f"[+] {len(findings)} security observations")
@@ -294,6 +319,7 @@ class RECONDZv2:
                 'input': target,
                 'resolved': actual_target,
                 'protocol': protocol,
+                'ip': target_ip,  # نضيف IP المستهدف
             },
             'algerian_context': algeria_info.__dict__ if algeria_info else None,
             'connection': {
@@ -331,7 +357,7 @@ class RECONDZv2:
 
         self._save_report(target)
         self._print_summary(algeria_info, response, discovered, findings,
-                            ip_enum_data, subdomain_data, port_data, cms_data, fingerprint_data)
+                            ip_enum_data, subdomain_data, port_data, cms_data, fingerprint_data, target_ip)
         return self.results
 
     def _get_discovery_paths(self, algeria_info) -> List[str]:
@@ -434,11 +460,13 @@ class RECONDZv2:
 
     def _print_summary(self, algeria_info, response, discovered, findings,
                        ip_enum_data=None, subdomain_data=None, port_data=None,
-                       cms_data=None, fingerprint_data=None):
+                       cms_data=None, fingerprint_data=None, target_ip=None):
         print(f"\n{'='*60}")
         print("SCAN SUMMARY")
         print(f"{'='*60}")
         print(f"Target: {self.results['target']['input']}")
+        if target_ip:
+            print(f"Resolved IP: {target_ip}")
         if algeria_info:
             print(f"Algerian: [+] YES")
             print(f"  Sector: {algeria_info.sector}")
