@@ -1,0 +1,87 @@
+{
+  "framework": {
+    "version": "2.0.0",
+    "session": "20260311_054716",
+    "license": "Authorized Security Assessment Only"
+  },
+  "target": {
+    "input": "univ-medea.dz",
+    "resolved": "www.univ-medea.dz",
+    "protocol": "https://"
+  },
+  "algerian_context": {
+    "domain": "univ-medea.dz",
+    "ip": null,
+    "sector": "education",
+    "criticality": "medium",
+    "isp": "unknown",
+    "city": null,
+    "compliance_requirements": [],
+    "common_vulnerabilities": [
+      "student_data_exposure",
+      "weak_authentication",
+      "open_directories",
+      "shared_hosting_risks",
+      "outdated_systems",
+      "research_data_leaks",
+      "unsecured_wifi",
+      "bring_your_own_device_risks"
+    ],
+    "threat_actors": [
+      "Student_hackers",
+      "Credential_stuffing"
+    ],
+    "recommended_tests": [
+      "subdomain_enumeration",
+      "technology_fingerprinting",
+      "ssl_tls_analysis",
+      "security_headers",
+      "exposed_endpoints",
+      "student_data_privacy",
+      "research_ip_protection",
+      "campus_network_security",
+      "byod_policy_compliance"
+    ],
+    "is_government": false,
+    "is_education": true,
+    "is_banking": false,
+    "is_telecom": false,
+    "is_energy": false,
+    "is_health": false,
+    "is_media": false,
+    "asn": null,
+    "ip_range": null
+  },
+  "connection": {
+    "status": 200,
+    "time": 2.2513124480610713,
+    "server": "",
+    "powered_by": ""
+  },
+  "technologies": [
+    "cms:wordpress"
+  ],
+  "protection": {
+    "waf": null,
+    "internal_mode": false
+  },
+  "discovery": {
+    "tested": 13,
+    "found": 0,
+    "endpoints": []
+  },
+  "findings": [
+    {
+      "name": "Missing Security Headers",
+      "severity": "medium",
+      "detail": "Missing: x-frame-options, x-content-type-options, content-security-policy, strict-transport-security",
+      "recommendation": "Implement security headers"
+    }
+  ],
+  "statistics": {
+    "requests_total": 1,
+    "requests_success": 1,
+    "requests_failed": 15
+  },
+  "timestamp": "2026-03-11T05:47:34.260890"
+}
