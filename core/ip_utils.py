@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 import ipaddress
 from typing import Optional, Tuple
+# السطر الناقص الذي تسبب في الخطأ
+from core.async_engine import AsyncReconEngine 
 
 CDN_NETWORKS = {
     'Cloudflare': ['103.21.244.0/22', '104.16.0.0/13', '172.64.0.0/13'],
@@ -25,6 +27,5 @@ async def extract_real_ip(domain: str, engine: AsyncReconEngine) -> Optional[str
     for sub in shadow_subs:
         real_ip = await engine.resolve_hostname(sub)
         if real_ip:
-            # التأكد أن الـ IP الجديد ليس CDN أيضاً
             return real_ip
     return ip
