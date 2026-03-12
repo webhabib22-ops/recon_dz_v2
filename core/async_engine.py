@@ -78,8 +78,13 @@ class ResponseData:
 
 class DNSResolver:
     """
-    DNS-over-HTTPS resolver for restricted/censored environments.
-    Uses Cloudflare, Google, and Quad9 DoH endpoints.
+    Multi-strategy DNS resolver:
+      1. DNS-over-HTTPS (Cloudflare / Google / Quad9) — bypasses censorship
+      2. aiodns async system resolver (fast, non-blocking)
+      3. socket.getaddrinfo  synchronous fallback (always works if network is up)
+
+    The three-layer fallback means the engine NEVER fails on DNS even when
+    DoH providers are unreachable (Termux, restricted networks, firewalls).
     """
 
     DOH_SERVERS = [
@@ -90,61 +95,97 @@ class DNSResolver:
 
     def __init__(self):
         self._cache: Dict[str, Optional[str]] = {}
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._session:     Optional[aiohttp.ClientSession] = None
+        self._aiodns:      Optional[Any]                   = None  # aiodns.Resolver
 
     async def initialize(self):
-        """Create the aiohttp session for DoH queries."""
-        ssl_ctx = ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
+        """Set up DoH session and aiodns resolver."""
+        # DoH session — no SSL verification needed for DNS queries
+        connector = aiohttp.TCPConnector(limit=10, ssl=False)
+        timeout   = aiohttp.ClientTimeout(total=5, connect=3)
+        self._session = aiohttp.ClientSession(
+            connector=connector, timeout=timeout
+        )
 
-        connector = aiohttp.TCPConnector(limit=10, ssl=ssl_ctx)
-        # [FIX] Use ClientTimeout object instead of raw int
-        timeout = aiohttp.ClientTimeout(total=8, connect=3)
-        self._session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+        # aiodns — optional, only used if the package is installed
+        try:
+            import aiodns
+            self._aiodns = aiodns.DNSResolver(loop=asyncio.get_event_loop())
+        except (ImportError, Exception):
+            self._aiodns = None
 
-    async def resolve(self, hostname: str, record_type: str = 'A') -> Optional[str]:
+    async def resolve(self, hostname: str,
+                      record_type: str = 'A') -> Optional[str]:
         """
-        Resolve a hostname to an IP address via DoH.
-        Returns the first A (or AAAA) record found, or None.
+        Resolve hostname → IP using three fallback strategies.
+        Returns the first IP found, or None if all fail.
         """
+        # Strip any path/port accidentally included in hostname
+        hostname = hostname.split('/')[0].split(':')[0].strip()
+        if not hostname:
+            return None
+
         cache_key = f"{hostname}:{record_type}"
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        # Try each DoH provider in order
-        for name, doh_url in self.DOH_SERVERS:
+        ip: Optional[str] = None
+
+        # ── Strategy 1: DoH (Cloudflare → Google → Quad9) ──────────
+        for _name, doh_url in self.DOH_SERVERS:
             try:
-                ip = await self._query_doh(doh_url, hostname, record_type)
+                ip = await asyncio.wait_for(
+                    self._query_doh(doh_url, hostname, record_type),
+                    timeout=5.0
+                )
                 if ip:
-                    self._cache[cache_key] = ip
-                    return ip
+                    break
             except Exception:
                 continue
 
-        # Fallback: system resolver (may be blocked in some environments)
-        try:
-            family = socket.AF_INET if record_type == 'A' else socket.AF_INET6
-            infos = socket.getaddrinfo(hostname, None, family, socket.SOCK_STREAM)
-            if infos:
-                ip = infos[0][4][0]
-                self._cache[cache_key] = ip
-                return ip
-        except Exception:
-            pass
+        # ── Strategy 2: aiodns async resolver ──────────────────────
+        if not ip and self._aiodns:
+            try:
+                qtype = 'A' if record_type == 'A' else 'AAAA'
+                result = await asyncio.wait_for(
+                    self._aiodns.query(hostname, qtype),
+                    timeout=5.0
+                )
+                if result:
+                    ip = str(result[0].host)
+            except Exception:
+                pass
 
-        self._cache[cache_key] = None
-        return None
+        # ── Strategy 3: synchronous socket (always available) ──────
+        if not ip:
+            try:
+                loop   = asyncio.get_event_loop()
+                family = socket.AF_INET if record_type == 'A' else socket.AF_INET6
+                infos  = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda: socket.getaddrinfo(
+                            hostname, None, family, socket.SOCK_STREAM
+                        )
+                    ),
+                    timeout=8.0
+                )
+                if infos:
+                    ip = infos[0][4][0]
+            except Exception:
+                pass
+
+        self._cache[cache_key] = ip
+        return ip
 
     async def _query_doh(self, doh_url: str, hostname: str,
-                         record_type: str = 'A') -> Optional[str]:
-        """Issue a DNS-over-HTTPS query and return the first record data."""
-        rtype_num = 1 if record_type == 'A' else 28  # AAAA = 28
-        params = {'name': hostname, 'type': record_type}
-        headers = {'Accept': 'application/dns-json'}
-
+                          record_type: str = 'A') -> Optional[str]:
+        """Issue a single DoH query."""
+        rtype_num = 1 if record_type == 'A' else 28
+        params    = {'name': hostname, 'type': record_type}
+        headers   = {'Accept': 'application/dns-json'}
         async with self._session.get(
-            doh_url, params=params, headers=headers, ssl=False
+            doh_url, params=params, headers=headers
         ) as resp:
             if resp.status == 200:
                 data = await resp.json(content_type=None)
@@ -218,15 +259,16 @@ class AsyncReconEngine:
         self.dns_resolver = DNSResolver()
         await self.dns_resolver.initialize()
 
-        ssl_ctx = ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
-
+        # ssl=False on the connector lets each request decide its own SSL handling.
+        # Passing an ssl_ctx here conflicts with ssl=False in individual requests
+        # and causes "Cannot connect to host ... ssl:False" errors even when
+        # the host is reachable. Setting ssl=False at connector level disables
+        # certificate verification globally (acceptable for recon tools).
         connector = aiohttp.TCPConnector(
             limit=self.max_concurrent,
             limit_per_host=5,
             enable_cleanup_closed=True,
-            ssl=ssl_ctx,
+            ssl=False,              # No SSL verification — avoids cert errors
             ttl_dns_cache=300,
         )
 
@@ -361,14 +403,15 @@ class AsyncReconEngine:
         path: str = '/',
     ) -> Tuple[ResponseData, str, str]:
         """
-        Try multiple connection strategies in order:
-          1. Resolve via DoH → connect to IP with Host header (HTTPS then HTTP)
-          2. Direct URL fallback (system DNS)
-          3. www. prefix variants
+        Try multiple connection strategies in order until one succeeds:
+
+          For each candidate hostname (bare, then www.):
+            1. DoH resolve → IP + Host header  (HTTPS then HTTP)
+            2. Direct hostname URL via system DNS  (HTTPS then HTTP)
 
         Returns: (ResponseData, protocol_str, actual_hostname)
         """
-        candidates = [hostname]
+        candidates: List[str] = [hostname]
         if www_fallback and not hostname.startswith('www.'):
             candidates.append(f'www.{hostname}')
 
@@ -378,27 +421,28 @@ class AsyncReconEngine:
             ip = await self.resolve_hostname(host)
 
             for proto in ('https://', 'http://'):
+                # Attempt A: resolved IP + Host header (bypass CDN/DNS)
                 if ip:
-                    # Direct IP connection with Host header — bypasses DNS/CDN filtering
                     url  = f"{proto}{ip}{path}"
                     resp = await self._request_with_host(url, host)
-                else:
-                    # Fallback: direct hostname (system DNS)
-                    url  = f"{proto}{host}{path}"
-                    resp = await self.request(url)
+                    last_response = resp
+                    if resp.status != 0 and resp.status < 500:
+                        resp.final_url = f"{proto}{host}{path}"
+                        resp.protocol  = proto.rstrip('://')
+                        return resp, proto, host
 
+                # Attempt B: direct hostname (system DNS via aiohttp)
+                url  = f"{proto}{host}{path}"
+                resp = await self.request(url)
                 last_response = resp
-
                 if resp.status != 0 and resp.status < 500:
-                    # Normalize the final URL to show hostname instead of IP
-                    resp.final_url = f"{proto}{host}{path}"
+                    resp.final_url = url
                     resp.protocol  = proto.rstrip('://')
                     return resp, proto, host
 
-        # All attempts failed
         error_resp = last_response or _error_response(
             f"https://{hostname}{path}",
-            "All connection attempts failed (DoH + direct)"
+            "All connection attempts failed (DoH + direct + www)"
         )
         return error_resp, 'https://', hostname
 
@@ -487,3 +531,4 @@ def detect_waf_response(response: ResponseData) -> Optional[str]:
             return waf_name
 
     return None
+
