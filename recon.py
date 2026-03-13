@@ -45,12 +45,17 @@ from core.algeria_threats    import AlgeriaThreatDatabase
 from core.ip_utils           import extract_real_ip
 from core.ip_enumerator      import IPEnumerator
 from core.host_profiler      import HostProfiler, generate_host_profile_html
+from core.stealth_engine     import (
+    StealthScanner, CDNBypass, BlockDetector,
+    GhostRequester, RateLimitEvader
+)
 from core.domain_validator   import DomainValidator
 from core.subdomain_enum     import SubdomainEnumerator
 from core.cms_detector       import CMSDetector
 from core.port_scanner       import PortScanner
 from core.server_fingerprint import ServerFingerprinter
 from core.vuln_scanner       import VulnScanner
+from core.intelligence_engine import IntelligenceEngine
 from core.waf_analyzer       import (
     WAFAnalyzer, WAF_PROBES, WAFProfile,
     save_waf_report, generate_waf_html_report,
@@ -208,6 +213,7 @@ class ScanMode:
             self._on('cms'),
             self._on('fingerprint'),
             self._on('waf_check'),
+            self._on('intel'),
         ])
         return 4 + optional  # base phases: intel + conn + endpoint + vuln
 
@@ -310,6 +316,19 @@ class ScanMode:
             pc += 1; _ph(pc, TOTAL, "WAF Defensive Analysis (Inline)")
             waf_data = await self._run_waf_inline(base_url)
 
+        # ── OPTIONAL: Intelligence Engine (Behavioral) ────────────
+        intel_data: Optional[Dict] = None
+        if self._on('intel'):
+            pc += 1; _ph(pc, TOTAL, "Behavioral Fingerprinting & Attack Surface Map")
+            intel_data = await self._run_intelligence(
+                base_url   = base_url,
+                cms_info   = cms_data or [],
+                vuln_data  = findings or [],
+                server_fp  = fp_data or {},
+                open_ports = (port_data or {}).get('open_ports', []),
+                subdomains = subdomain_list or [],
+            )
+
         # ── Compile & Save ────────────────────────────────────────
         self.results = {
             'meta': {
@@ -343,6 +362,7 @@ class ScanMode:
         if cms_data:   self.results['cms']            = cms_data
         if fp_data:    self.results['fingerprint']    = fp_data
         if waf_data:   self.results['waf_analysis']   = waf_data
+        if intel_data: self.results['intelligence']   = intel_data
 
         paths = self._save_reports(host)
         self._print_summary(ali, resp, waf, target_ip, discovered,
@@ -482,6 +502,60 @@ class ScanMode:
         else:
             print(f"  {G}[+]{RS} No critical findings detected")
         return findings
+
+    async def _run_intelligence(self, base_url: str,
+                                 cms_info:   list,
+                                 vuln_data:  list,
+                                 server_fp:  dict,
+                                 open_ports: list,
+                                 subdomains: list) -> Dict:
+        """
+        Behavioral fingerprinting + Attack surface mapping.
+        يشغّل 10 probes ذكية ويولّد خريطة الثغرات الكاملة.
+        """
+        ie = IntelligenceEngine(self.e)
+        result = await ie.analyze(
+            base_url      = base_url,
+            cms_info      = cms_info,
+            vuln_findings = vuln_data,
+            server_fp     = server_fp,
+            open_ports    = open_ports,
+            subdomains    = subdomains,
+        )
+
+        # Print summary
+        grade = result.get('risk_grade', '?')
+        score = result.get('risk_score', 0)
+        grade_colors = {
+            'CRITICAL': R, 'HIGH': Y, 'MEDIUM': C, 'LOW': G, 'MINIMAL': G}
+        gc = grade_colors.get(grade, W)
+
+        print(f"  {G}[+]{RS} Risk Score : {gc}{score}/100  [{grade}]{RS}")
+        print(f"  {R}[!]{RS} Critical   : {result.get('critical',0)}"
+              f"  {Y}High: {result.get('high',0)}{RS}"
+              f"  Medium: {result.get('medium',0)}"
+              f"  Low: {result.get('low',0)}")
+
+        vectors = result.get('attack_vectors', [])
+        if vectors:
+            print(f"\n  {C}Attack Vectors ({len(vectors)}):{RS}")
+            for v in vectors[:8]:
+                sev = v.get('severity','?')
+                sc  = (R if sev=='critical' else Y if sev=='high'
+                       else C if sev=='medium' else W)
+                print(f"    {sc}[{sev.upper():<8}]{RS} {v.get('name','')}")
+                if v.get('bypass_hint'):
+                    print(f"              {M}→ {v['bypass_hint']}{RS}")
+            if len(vectors) > 8:
+                print(f"    … +{len(vectors)-8} more (see HTML report)")
+
+        chains = result.get('attack_chains', [])
+        if chains:
+            print(f"\n  {Y}Attack Chains:{RS}")
+            for ch in chains:
+                print(f"    [{ch.get('likelihood','?')}] {ch.get('name','')}")
+
+        return result
 
     async def _run_waf_inline(self, base_url: str) -> Optional[Dict]:
         print(f"  {C}[*]{RS} Running WAF behavioral probe (66 payloads) …")
@@ -1221,6 +1295,8 @@ WAF CATEGORIES
     g.add_argument('--cms',               action='store_true')
     g.add_argument('--fingerprint',       action='store_true')
     g.add_argument('--vuln',             action='store_true')
+    g.add_argument('--intel',            action='store_true',
+                   help='Behavioral fingerprinting + Attack surface map (recommended)')
     g.add_argument('--waf-check',         action='store_true', dest='waf_check',
                    help='Add inline WAF analysis phase to scan')
 
@@ -1283,6 +1359,12 @@ Host Intelligence Profiler
     prof.add_argument('--max-concurrent',   type=int, default=30)
     prof.add_argument('--output-dir',       default='./results')
     prof.add_argument('--internal',         action='store_true')
+    prof.add_argument('--stealth',          action='store_true',
+                      help='Ghost mode — rotate identity per domain')
+    prof.add_argument('--cdn-bypass',       action='store_true',
+                      help='Find origin IPs behind Cloudflare/Akamai')
+    prof.add_argument('--block-analysis',   action='store_true',
+                      help='Analyze HOW the target blocks you')
     prof.add_argument('-v', '--verbose',    action='store_true')
 
     p.add_argument('--version', action='version', version=f'RECON-DZ v{VERSION}')
@@ -1292,6 +1374,93 @@ Host Intelligence Profiler
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  ASYNC DISPATCHER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+async def _mode_stealth_analysis(engine: AsyncReconEngine, args):
+    """
+    Standalone stealth analysis mode.
+    Runs block detection + CDN bypass + ghost scan report.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+    from datetime import datetime as _dt
+
+    target  = getattr(args, 'target', None) or getattr(args, 'ip', None)
+    out_dir = _Path(getattr(args, 'output_dir', './results'))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Detect domain or IP
+    domain = target.lstrip('https://').lstrip('http://').split('/')[0]
+
+    _sep('═')
+    print(f"  {C}[GHOST MODE]{RS} Target: {Y}{domain}{RS}")
+    _sep('═')
+
+    scanner = StealthScanner(engine, stealth_level='normal')
+    detector = BlockDetector(engine)
+
+    print(f"  {C}[1/3]{RS} Analyzing protection layers…")
+    block_info = await detector.analyze(domain)
+
+    print(f"  {C}[2/3]{RS} Executing CDN bypass…")
+    cdn_bypass = CDNBypass(engine)
+    origins    = await cdn_bypass.find_origin(domain)
+
+    print(f"  {C}[3/3]{RS} Ghost-mode scan…")
+    origin_ip = origins[0].ip if origins and origins[0].confidence >= 50 else None
+    ghost     = GhostRequester(engine, stealth_level='normal')
+    resp      = await ghost.get(f'https://{domain}', origin_ip=origin_ip)
+
+    # Print results
+    _sep('═')
+    print(f"  {B}STEALTH ANALYSIS RESULTS{RS}")
+    _sep('═')
+
+    print(f"  CDN      : {block_info.cdn_name or 'None detected'}")
+    print(f"  WAF      : {block_info.waf_name or 'None detected'}")
+    print(f"  Blocked  : {R+'YES'+RS if block_info.is_blocked else G+'NO'+RS}")
+    print(f"  Block type: {Y}{block_info.block_type}{RS}")
+    print()
+
+    if origins:
+        print(f"  {G}Origin IPs found:{RS}")
+        for o in origins[:5]:
+            bar = '█' * (o.confidence // 10) + '░' * (10 - o.confidence // 10)
+            print(f"    {G}→{RS} {C}{o.ip:>18}{RS}  [{bar}] {o.confidence}%  {o.method}")
+        if origin_ip:
+            print(f"\n  {G}[✓]{RS} Best origin: {Y}{origin_ip}{RS}")
+            print(f"  {G}[✓]{RS} Ghost response via origin: HTTP {resp.status}")
+    else:
+        print(f"  {Y}[i]{RS} No origin IPs found (well-protected or not behind CDN)")
+
+    if block_info.bypass_methods:
+        print(f"\n  {Y}Recommended bypass techniques:{RS}")
+        for m in block_info.bypass_methods:
+            print(f"    {C}·{RS} {m}")
+
+    print(f"\n  {Y}Evidence collected:{RS}")
+    for e in block_info.evidence:
+        print(f"    · {e}")
+
+    # Save
+    ts = _dt.now().strftime('%Y%m%d_%H%M%S')
+    safe = domain.replace('.', '_')
+    jp   = out_dir / f"{ts}_stealth_{safe}.json"
+    report = {
+        'domain':    domain,
+        'block':     block_info.__dict__,
+        'origins':   [{'ip': o.ip, 'conf': o.confidence,
+                       'method': o.method} for o in origins],
+        'ghost_http_status': resp.status,
+        'origin_used': origin_ip,
+    }
+    jp.write_text(
+        _json.dumps(report, indent=2, ensure_ascii=False, default=str),
+        encoding='utf-8'
+    )
+    _sep()
+    print(f"  {G}[+]{RS} Report: {jp}")
+    _sep('═')
 
 async def _mode_profile(engine: AsyncReconEngine, args):
     """
