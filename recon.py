@@ -44,6 +44,7 @@ from core.async_engine       import AsyncReconEngine, ResponseData, detect_waf_r
 from core.algeria_threats    import AlgeriaThreatDatabase
 from core.ip_utils           import extract_real_ip
 from core.ip_enumerator      import IPEnumerator
+from core.host_profiler      import HostProfiler, generate_host_profile_html
 from core.domain_validator   import DomainValidator
 from core.subdomain_enum     import SubdomainEnumerator
 from core.cms_detector       import CMSDetector
@@ -1261,6 +1262,29 @@ WAF CATEGORIES
     r.add_argument('--json',              required=True, dest='json_file',
                    help='Path to .json report')
 
+    # ── PROFILE ───────────────────────────────────────────────────────
+    prof = sub.add_parser('profile',
+        help='Discover & profile ALL domains hosted on an IP',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="""
+Host Intelligence Profiler
+  Given an IP, discover every co-hosted domain and profile:
+  - HTTP status, title, server
+  - CMS name + exact version + confidence
+  - Tech stack (PHP, Node, Java...)
+  - Security header grade (A-F)
+  - Algeria sector / criticality
+  - Source attribution (SSL cert, crt.sh, HackerTarget...)
+""")
+    prof.add_argument('-i', '--ip',         required=True,
+                      help='Target IP address (e.g. 157.90.129.171)')
+    prof.add_argument('--concurrency',      type=int, default=10,
+                      help='Parallel domain profiles (default: 10)')
+    prof.add_argument('--max-concurrent',   type=int, default=30)
+    prof.add_argument('--output-dir',       default='./results')
+    prof.add_argument('--internal',         action='store_true')
+    prof.add_argument('-v', '--verbose',    action='store_true')
+
     p.add_argument('--version', action='version', version=f'RECON-DZ v{VERSION}')
     return p
 
@@ -1268,6 +1292,104 @@ WAF CATEGORIES
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  ASYNC DISPATCHER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def _mode_profile(engine: AsyncReconEngine, args):
+    """
+    Host Intelligence Profiler mode.
+    Discovers all co-hosted domains on an IP and profiles each one.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+    from datetime import datetime as _dt
+
+    ip        = args.ip
+    conc      = getattr(args, 'concurrency', 10)
+    out_dir   = _Path(getattr(args, 'output_dir', './results'))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    verbose   = getattr(args, 'verbose', False)
+
+    _sep('═')
+    print(f"  Target IP  : {Y}{ip}{RS}")
+    print(f"  Concurrency: {conc} parallel profiles")
+    print(f"  Output     : {out_dir}")
+    _sep('═')
+
+    profiler = HostProfiler(engine, AlgeriaThreatDatabase(), concurrency=conc)
+
+    # Progress callback
+    def _progress(current, total, domain):
+        bar_w = 30
+        filled = int(bar_w * current / max(total, 1))
+        bar   = '█' * filled + '░' * (bar_w - filled)
+        print(f"  [{bar}] {current:>3}/{total}  {C}{domain[:45]}{RS}  " + ' '*10,
+              end='\r', flush=True)
+
+    print(f"\n  {C}[*]{RS} Enumerating co-hosted domains…\n")
+    report = await profiler.profile_ip(ip, progress_cb=_progress)
+    print()   # newline after progress bar
+
+    # Print summary
+    _sep('═')
+    print(f"  {B}HOST PROFILE COMPLETE{RS}")
+    _sep('═')
+    print(f"  IP          : {ip}")
+    print(f"  ASN         : AS{report.get('asn','?')}  ({report.get('org','?')})")
+    print(f"  CIDR        : {report.get('cidr','?')}  [{report.get('country','?')}]")
+    print(f"  Domains     : {report.get('total_domains',0)} found  "
+          f"({G}{report.get('active_domains',0)} active{RS})")
+    print(f"  Scan time   : {report.get('elapsed_s','?')}s\n")
+
+    cms_sum = report.get('cms_summary', {})
+    if cms_sum:
+        print(f"  CMS Distribution:")
+        for cms_name, count in sorted(cms_sum.items(), key=lambda x:-x[1]):
+            print(f"    {G}·{RS} {cms_name:<25} {count} site(s)")
+        print()
+
+    # Print active domains table
+    active = [d for d in report.get('domains', []) if d.get('active')]
+    if verbose:
+        domains_to_show = report.get('domains', [])
+    else:
+        domains_to_show = active[:40]
+
+    print(f"  {'DOMAIN':<40} {'STATUS':>6}  {'CMS':<20} {'VER':<10} {'SEC':<4}  STACK")
+    print(f"  {'─'*40} {'─'*6}  {'─'*20} {'─'*10} {'─'*4}  ─────────")
+    for d in domains_to_show:
+        if not d.get('active') and not verbose:
+            continue
+        cms  = d.get('cms') or {}
+        name = (cms.get('name','—'))[:20]
+        ver  = (cms.get('version') or '—')[:10]
+        sec  = (d.get('security',{}).get('grade','?'))
+        stk  = ', '.join(d.get('stack',[])[:2])[:20]
+        dom  = d.get('domain','?')[:40]
+        st   = d.get('status', 0)
+        sec_c = (G if sec in ('A','B') else Y if sec=='C' else R)
+        ver_c = Y if ver != '—' else ''
+        print(f"  {dom:<40} {str(st):>6}  {name:<20} {ver_c}{ver:<10}{RS} "
+              f"{sec_c}{sec:<4}{RS}  {stk}")
+
+    if len(active) > 40 and not verbose:
+        print(f"  … +{len(active)-40} more  (use -v to show all)")
+
+    # Save reports
+    ts   = _dt.now().strftime('%Y%m%d_%H%M%S')
+    safe = ip.replace('.','_')
+    jp   = out_dir / f"{ts}_profile_{safe}.json"
+    hp   = out_dir / f"{ts}_profile_{safe}.html"
+
+    jp.write_text(
+        _json.dumps(report, indent=2, ensure_ascii=False, default=str),
+        encoding='utf-8'
+    )
+    hp.write_text(generate_host_profile_html(report), encoding='utf-8')
+
+    _sep()
+    print(f"  {G}[+]{RS} JSON : {jp}")
+    print(f"  {G}[+]{RS} HTML : {hp}")
+    _sep('═')
+
 
 async def _dispatch(args):
     mode = getattr(args, 'mode', None)
@@ -1279,7 +1401,8 @@ async def _dispatch(args):
         print(f"  {C}scan{RS}    Full reconnaissance — DNS · ports · CMS · vulns · fingerprint")
         print(f"  {Y}waf{RS}     Defensive WAF analysis — 66 probes · blind-spot detection")
         print(f"  {M}batch{RS}   Multi-target scan from a text file")
-        print(f"  {G}report{RS}  Regenerate HTML from an existing JSON report\n")
+        print(f"  {G}report{RS}  Regenerate HTML from an existing JSON report")
+        print(f"  {C}profile{RS} Host Intelligence — ALL co-hosted domains + CMS + security grade\n")
         return
 
     # ── SCAN mode ────────────────────────────────────────────────────
@@ -1324,6 +1447,18 @@ async def _dispatch(args):
             await engine.close()
 
     # ── REPORT mode ──────────────────────────────────────────────────
+    elif mode == 'profile':
+        banner('profile')
+        print(f"  {Y}[!]{RS} Host profiler — authorized use only.\n")
+        engine = await build_engine(
+            max_concurrent=getattr(args,'max_concurrent',30),
+            internal=getattr(args,'internal',False),
+        )
+        try:
+            await _mode_profile(engine, args)
+        finally:
+            await engine.close()
+
     elif mode == 'report':
         banner('report')
         jp = Path(args.json_file)
