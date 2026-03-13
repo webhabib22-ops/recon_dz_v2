@@ -326,7 +326,7 @@ class ScanMode:
                 vuln_data  = findings or [],
                 server_fp  = fp_data or {},
                 open_ports = (port_data or {}).get('open_ports', []),
-                subdomains = subdomain_list or [],
+                subdomains = (sub_data or {}).get('subdomains', []),
             )
 
         # ── Compile & Save ────────────────────────────────────────
