@@ -1277,7 +1277,7 @@ Host Intelligence Profiler
   - Source attribution (SSL cert, crt.sh, HackerTarget...)
 """)
     prof.add_argument('-i', '--ip',         required=True,
-                      help='Target IP address (e.g. 157.90.129.171)')
+                      help='Target IP or domain name (e.g. 41.111.1.1 OR example.dz)')
     prof.add_argument('--concurrency',      type=int, default=10,
                       help='Parallel domain profiles (default: 10)')
     prof.add_argument('--max-concurrent',   type=int, default=30)
@@ -1302,14 +1302,33 @@ async def _mode_profile(engine: AsyncReconEngine, args):
     from pathlib import Path as _Path
     from datetime import datetime as _dt
 
-    ip        = args.ip
+    target    = args.ip.strip()
     conc      = getattr(args, 'concurrency', 10)
     out_dir   = _Path(getattr(args, 'output_dir', './results'))
     out_dir.mkdir(parents=True, exist_ok=True)
     verbose   = getattr(args, 'verbose', False)
 
+    # ── Resolve domain → IP if a hostname was given ──────────────
+    import re as _re
+    is_ip = bool(_re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', target))
+    if is_ip:
+        ip = target
+        domain_input = None
+    else:
+        # It's a domain name — resolve it first
+        domain_input = target
+        print(f"\n  {C}[*]{RS} Resolving {Y}{target}{RS} → IP …")
+        ip = await engine.resolve_hostname(target)
+        if not ip:
+            print(f"  {R}[!]{RS} Could not resolve hostname: {target}")
+            return
+        print(f"  {G}[+]{RS} Resolved: {Y}{ip}{RS}\n")
+
     _sep('═')
-    print(f"  Target IP  : {Y}{ip}{RS}")
+    if domain_input:
+        print(f"  Target     : {Y}{domain_input}{RS}  →  {C}{ip}{RS}")
+    else:
+        print(f"  Target IP  : {Y}{ip}{RS}")
     print(f"  Concurrency: {conc} parallel profiles")
     print(f"  Output     : {out_dir}")
     _sep('═')
