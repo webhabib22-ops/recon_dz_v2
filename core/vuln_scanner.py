@@ -10,11 +10,15 @@ Passive and semi-active vulnerability checks:
 - Default credentials exposure
 - API endpoint discovery
 - Information disclosure patterns
+- Legacy forensic analysis (swap, temp, backups)
+- Blind injection timing (side‑channel)
 """
 
 import re
 import asyncio
-from typing import Dict, List, Optional, Any
+import time
+import statistics
+from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
 
 from core.async_engine import AsyncReconEngine, ResponseData
@@ -25,7 +29,7 @@ class Finding:
     """A single security finding."""
     name:           str
     severity:       str          # critical | high | medium | low | info
-    category:       str          # exposure | misconfiguration | version | compliance
+    category:       str          # exposure | misconfiguration | version | compliance | forensic | timing
     detail:         str
     url:            Optional[str] = None
     recommendation: str           = ""
@@ -52,7 +56,6 @@ class VulnScanner:
     """
 
     # Sensitive paths that should NOT be publicly accessible
-    # (Base list, will be extended dynamically if server technology is known)
     SENSITIVE_PATHS = [
         # Version control
         '/.git/HEAD', '/.git/config', '/.svn/entries',
@@ -83,6 +86,26 @@ class VulnScanner:
         # Algerian-specific paths
         '/portail/', '/extranet/', '/intranet/',
     ]
+
+    # =============== NEW: Legacy Forensic Paths ===============
+    # Swap files, editor backups, temporary files
+    LEGACY_PATHS = [
+        # Vim swap files
+        '/.index.php.swp', '/.index.php.swo', '/.index.php.swn',
+        '/.wp-config.php.swp', '/.config.php.swp',
+        '/.main.py.swp', '/.app.js.swp',
+        # Editor backups
+        '/index.php~', '/wp-config.php~', '/config.php~',
+        '/main.py~', '/app.js~',
+        '/index.php.bak', '/wp-config.php.bak', '/config.php.bak',
+        '/.index.php.old', '/.wp-config.php.old',
+        # Temporary files
+        '/tmp/index.php', '/tmp/config.php', '/tmp/backup.sql',
+        '/cache/index.html', '/.cache/config.php',
+        # Windows-style
+        '/Thumbs.db', '/.DS_Store',
+    ]
+    # ===========================================================
 
     # Headers that should be present on production sites
     REQUIRED_HEADERS = {
@@ -141,11 +164,9 @@ class VulnScanner:
         self.engine = engine
 
     async def scan(self, base_url: str, main_response: ResponseData,
-                   algeria_info=None, server_tech: Optional[Dict] = None) -> List[Finding]:
+                   algeria_info=None) -> List[Finding]:
         """
         Run all vulnerability checks against base_url.
-        - algeria_info: object from AlgeriaThreatDatabase.identify_target()
-        - server_tech:  dict with detected technologies (e.g. {'server': 'Apache', 'php_version': '8.2'})
         Returns a list of Finding objects sorted by severity.
         """
         findings: List[Finding] = []
@@ -156,8 +177,8 @@ class VulnScanner:
         # 2. Server version disclosure
         findings.extend(self._check_version_disclosure(main_response))
 
-        # 3. Sensitive file exposure (concurrent) – with technology‑aware paths
-        file_findings = await self._check_sensitive_files(base_url, server_tech)
+        # 3. Sensitive file exposure (concurrent)
+        file_findings = await self._check_sensitive_files(base_url)
         findings.extend(file_findings)
 
         # 4. Directory listing
@@ -169,12 +190,22 @@ class VulnScanner:
         # 6. Cookie security flags
         findings.extend(self._check_cookie_flags(main_response))
 
-        # 7. Algeria-specific compliance – FIX: safe access to attributes
+        # 7. Algeria-specific compliance
         if algeria_info:
             findings.extend(self._check_algeria_compliance(main_response, algeria_info))
 
         # 8. Information disclosure in response
         findings.extend(self._check_info_disclosure(main_response))
+
+        # =============== NEW: Legacy forensic scan ===============
+        legacy_findings = await self._check_legacy_files(base_url)
+        findings.extend(legacy_findings)
+        # ==========================================================
+
+        # =============== NEW: Blind injection timing ===============
+        timing_findings = await self._check_blind_injection_timing(base_url)
+        findings.extend(timing_findings)
+        # ============================================================
 
         # Sort: critical → high → medium → low → info
         _sev_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4}
@@ -182,7 +213,7 @@ class VulnScanner:
 
         return findings
 
-    # ──────────────── Check Methods ───────────────────────────────────
+    # ──────────────── Existing Check Methods ─────────────────────────
 
     def _check_security_headers(self, resp: ResponseData) -> List[Finding]:
         findings: List[Finding] = []
@@ -230,33 +261,13 @@ class VulnScanner:
                         ))
         return findings
 
-    async def _check_sensitive_files(self, base_url: str,
-                                      server_tech: Optional[Dict] = None) -> List[Finding]:
+    async def _check_sensitive_files(self, base_url: str) -> List[Finding]:
         """Check for exposed sensitive files concurrently."""
-        # Start with the base SENSITIVE_PATHS
-        paths_to_test = list(self.SENSITIVE_PATHS)
-
-        # --- Stack‑Specific Probing (point 2) ---
-        # If we know the server is Apache / PHP, add extra PHP‑specific paths
-        if server_tech:
-            server = server_tech.get('server', '').lower()
-            php_ver = server_tech.get('php_version', '')
-            if 'apache' in server or php_ver:
-                extra_php_paths = [
-                    '/phpinfo.php', '/info.php', '/test.php',
-                    '/.user.ini', '/php.ini', '/.htaccess',
-                    '/phpmyadmin/scripts/setup.php', '/pma/',
-                ]
-                # Avoid duplicates
-                for p in extra_php_paths:
-                    if p not in paths_to_test:
-                        paths_to_test.append(p)
-
         findings: List[Finding] = []
         sem   = asyncio.Semaphore(20)
         tasks = [
             self._probe_path(base_url, path, sem)
-            for path in paths_to_test
+            for path in self.SENSITIVE_PATHS
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for res in results:
@@ -374,11 +385,7 @@ class VulnScanner:
         """Check Algerian regulatory compliance requirements."""
         findings: List[Finding] = []
 
-        # FIX: Use getattr to avoid AttributeError when algeria_info lacks the attributes
-        is_gov = getattr(algeria_info, 'is_government', False)
-        is_bank = getattr(algeria_info, 'is_banking', False)
-
-        if is_gov:
+        if algeria_info.is_government:
             if not resp.get_header('strict-transport-security'):
                 findings.append(Finding(
                     name="Decree 26-07 Violation: No HSTS",
@@ -400,7 +407,7 @@ class VulnScanner:
                     compliance=['Decree_26_07_Article_12'],
                 ))
 
-        if is_bank:
+        if algeria_info.is_banking:
             if not resp.get_header('content-security-policy'):
                 findings.append(Finding(
                     name="PCI-DSS Violation: No Content Security Policy",
@@ -447,3 +454,88 @@ class VulnScanner:
                 ))
 
         return findings
+
+    # =============== NEW: Legacy Forensic Analysis ===============
+    async def _check_legacy_files(self, base_url: str) -> List[Finding]:
+        """Search for leftover swap/temp/backup files."""
+        findings: List[Finding] = []
+        sem = asyncio.Semaphore(10)
+        tasks = [self._probe_legacy_path(base_url, path, sem) for path in self.LEGACY_PATHS]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in results:
+            if isinstance(res, Finding):
+                findings.append(res)
+        return findings
+
+    async def _probe_legacy_path(self, base_url: str, path: str,
+                                   sem: asyncio.Semaphore) -> Optional[Finding]:
+        async with sem:
+            url = base_url.rstrip('/') + path
+            resp = await self.engine.request(url)
+            if resp.status == 200:
+                # Check if it looks like a text file (source code) or binary (swap)
+                is_text = bool(re.search(rb'<\?php|function|class|<\s*html', resp.body[:200], re.I))
+                content_type = resp.get_header('content-type', '')
+                if 'text/' in content_type or is_text:
+                    name = "Legacy Source File Exposed"
+                    sev = 'high' if '.env' in path or 'config' in path else 'medium'
+                else:
+                    name = "Legacy Binary/Temp File Exposed"
+                    sev = 'medium'
+
+                return Finding(
+                    name=name,
+                    severity=sev,
+                    category='forensic',
+                    detail=f"Legacy file {path} accessible (HTTP 200, {len(resp.body)} bytes). May contain old code or credentials.",
+                    url=url,
+                    recommendation="Remove all legacy backup files from web root.",
+                )
+        return None
+    # ==============================================================
+
+    # =============== NEW: Blind Injection Timing ===============
+    async def _check_blind_injection_timing(self, base_url: str) -> List[Finding]:
+        """
+        Detect potential blind injections by measuring response time differences.
+        Uses benign-looking parameters that might trigger slow SQL queries.
+        """
+        findings: List[Finding] = []
+        test_params = [
+            ("?id=1", "?id=1 AND 1=1", "?id=1 AND 1=2"),
+            ("?page=home", "?page=home' OR '1'='1", "?page=home' AND '1'='2"),
+            ("?user=admin", "?user=admin' SLEEP(1) --", "?user=admin' AND SLEEP(1) --"),
+        ]
+
+        for base, test1, test2 in test_params:
+            try:
+                # Baseline
+                t0 = time.perf_counter()
+                await self.engine.request(base_url + base)
+                t_base = time.perf_counter() - t0
+
+                # First test
+                t0 = time.perf_counter()
+                await self.engine.request(base_url + test1)
+                t1 = time.perf_counter() - t0
+
+                # Second test
+                t0 = time.perf_counter()
+                await self.engine.request(base_url + test2)
+                t2 = time.perf_counter() - t0
+
+                # If test1 or test2 significantly slower than baseline, possible blind injection
+                if t1 > t_base * 1.5 or t2 > t_base * 1.5:
+                    findings.append(Finding(
+                        name="Potential Blind Injection (Timing)",
+                        severity='high',
+                        category='timing',
+                        detail=f"Parameter {base} shows time deviation (baseline {t_base*1000:.2f}ms, test1 {t1*1000:.2f}ms, test2 {t2*1000:.2f}ms). May indicate SQLi/NoSQLi.",
+                        url=base_url + base,
+                        recommendation="Use parameterized queries and constant-time comparison.",
+                    ))
+                    break  # Only one finding per param set
+            except Exception:
+                continue
+        return findings
+    # ==============================================================
