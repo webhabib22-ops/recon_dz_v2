@@ -3,7 +3,7 @@
 """
 RECON-DZ v3 - Async HTTP Engine
 ================================
-نسخة أصلية مستقرة - بدون أي تعديلات
+نسخة مستقرة مع إصلاح DNS لبيئة Termux
 """
 
 import asyncio
@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 try:
     from aiohttp import ClientTimeout, ClientSession, TCPConnector
+    from aiohttp.resolver import AsyncResolver
 except ImportError:
     print("[!] aiohttp غير مثبت. يرجى تثبيته: pip install aiohttp")
     raise
@@ -114,11 +115,14 @@ class AsyncReconEngine:
     async def initialize(self):
         if self.session:
             return
+        # إعداد resolver صريح لـ DNS (Google DNS)
+        resolver = AsyncResolver(nameservers=['8.8.8.8', '8.8.4.4'])
         self.connector = TCPConnector(
             limit=self.max_concurrent,
             ttl_dns_cache=300,
             ssl=False,
             use_dns_cache=True,
+            resolver=resolver,  # استخدام resolver مخصص
         )
         timeout = ClientTimeout(total=self.timeout, connect=8)
         self.session = ClientSession(
