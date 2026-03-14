@@ -6,33 +6,7 @@ RECON-DZ v3 - Intelligence Engine  ★ NEVER SEEN BEFORE
 الفكرة الجوهرية:
   بدلاً من مجرد جمع المعلومات، هذا المحرك يفكر مثل المهاجم الحقيقي.
   يربط النقاط بين كل المعلومات المجمعة ويستنتج:
-
-  ┌─────────────────────────────────────────────────────────────────┐
-  │  BEHAVIORAL FINGERPRINTING  ←  الفكرة التي لم يفعلها أحد      │
-  │                                                                 │
-  │  نحلل سلوك السيرفر تحت ظروف مختلفة:                           │
-  │  • كيف يتصرف مع headers مشوهة؟                                 │
-  │  • أين تختفي الفروق بين WAF وراء الخادم الحقيقي؟              │
-  │  • ما الذي يكشفه الخطأ 404 مقارنة بـ 403 في مسارات محددة؟    │
-  │  • HTTP/1.0 vs HTTP/1.1 vs HTTP/2 — هل يختلف الرد؟           │
-  │  • هل الـ cache يكشف headers داخلية؟                           │
-  │  • هل chunked encoding يغير سلوك الـ WAF؟                     │
-  │  • هل هناك race condition في أوقات الاستجابة؟                  │
-  │  • ما الذي يكشفه timing attack في المسارات السرية؟             │
-  └─────────────────────────────────────────────────────────────────┘
-
-  ثم يولّد ATTACK SURFACE MAP — خريطة سطح الهجوم الكاملة مع:
-  - ترتيب الثغرات حسب احتمالية النجاح REAL
-  - تسلسل الهجوم المنطقي (attack chain)
-  - نقاط التحايل على الحماية
-  - توصيات الدفاع بنفس الدقة
-
-الفرق عن كل الأدوات الموجودة:
-  - Nmap     : يكشف المنافذ فقط
-  - Burp     : يحتاج proxy يدوي
-  - Nikto    : ضوضاء عالية، يُكشف فوراً
-  - OpenVAS  : ثقيل جداً، يحتاج installation
-  - RECON-DZ : passive + behavioral + intelligent, لا يُكشف
+  ...
 """
 
 import asyncio
@@ -667,8 +641,10 @@ class AttackSurfaceMapper:
                 vuln_findings: List,
                 server_fp:   Dict,
                 open_ports:  List[Dict],
-                subdomains:  List[str]) -> List[AttackVector]:
-
+                subdomains:  List) -> List[AttackVector]:
+        """
+        subdomains: قائمة تحتوي إما نصوصًا (أسماء نطاقات) أو قواميس تحتوي مفتاح 'domain'
+        """
         vectors: List[AttackVector] = []
 
         vectors.extend(self._from_behavior(behavior))
@@ -984,7 +960,11 @@ class AttackSurfaceMapper:
                 ))
         return vectors
 
-    def _from_subdomains(self, subs: List[str]) -> List[AttackVector]:
+    def _from_subdomains(self, subs: List) -> List[AttackVector]:
+        """
+        توليد AttackVectors من قائمة النطاقات الفرعية.
+        يدخل subs قائمة قد تحتوي على نصوص أو قواميس بمفتاح 'domain'.
+        """
         vectors: List[AttackVector] = []
         risky_keywords = {
             'dev':      ('Development Environment Exposed', 'high'),
@@ -1002,18 +982,28 @@ class AttackSurfaceMapper:
             'grafana':  ('Grafana Exposed', 'high'),
             'kibana':   ('Kibana Exposed', 'critical'),
         }
+
         for sub in subs:
+            # استخراج اسم النطاق إذا كان العنصر قاموسًا
+            if isinstance(sub, dict):
+                domain = sub.get('domain', '')
+                if not domain:
+                    continue
+            else:
+                domain = str(sub)
+
+            domain_lower = domain.lower()
             for kw, (name, sev) in risky_keywords.items():
-                if kw in sub.lower():
+                if kw in domain_lower:
                     vectors.append(AttackVector(
-                        name=f'{name}: {sub}',
+                        name=f'{name}: {domain}',
                         category='misconfig',
                         severity=sev,
                         confidence=0.7,
-                        evidence=[f'Subdomain {sub} contains keyword "{kw}"'],
-                        defense=f'Remove or restrict access to {sub} if not needed.',
+                        evidence=[f'Subdomain {domain} contains keyword "{kw}"'],
+                        defense=f'Remove or restrict access to {domain} if not needed.',
                     ))
-                    break
+                    break  # أول كلمة تظهر تكفي
         return vectors
 
     def _from_server_fp(self, fp: Dict) -> List[AttackVector]:
@@ -1060,7 +1050,7 @@ class IntelligenceEngine:
                       vuln_findings: Optional[List]       = None,
                       server_fp:    Optional[Dict]        = None,
                       open_ports:   Optional[List[Dict]]  = None,
-                      subdomains:   Optional[List[str]]   = None,
+                      subdomains:   Optional[List]        = None,
                       ) -> Dict[str, Any]:
         """
         تشغيل التحليل الكامل.
