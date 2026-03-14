@@ -3,7 +3,7 @@
 """
 RECON-DZ v3 - Async HTTP Engine
 ================================
-محرك الطلبات غير المتزامن (نسخة مستقرة مع دالة request_raw فقط)
+نسخة أصلية مستقرة - بدون أي تعديلات
 """
 
 import asyncio
@@ -11,7 +11,6 @@ import aiohttp
 import socket
 import random
 import time
-import re
 from typing import Dict, List, Optional, Tuple, Any
 from urllib.parse import urlparse
 from dataclasses import dataclass
@@ -23,9 +22,6 @@ except ImportError:
     raise
 
 
-# ─────────────────────────────────────────────────────────────────────
-#  ResponseData
-# ─────────────────────────────────────────────────────────────────────
 @dataclass
 class ResponseData:
     url: str
@@ -56,9 +52,6 @@ class ResponseData:
         via = self.get_header('via')
         if via:
             hints.append(f"via:{via}")
-        cf = self.get_header('cf-ray')
-        if cf:
-            hints.append("cloudflare")
         if self.body:
             lower = self.body.lower()
             if 'wp-content' in lower or 'wp-includes' in lower:
@@ -84,18 +77,11 @@ def detect_waf_response(resp: ResponseData) -> Optional[str]:
             return "AWS WAF"
         if 'incap_ses' in hdr_str:
             return "Imperva"
-        if 'mod_security' in body_lower:
-            return "ModSecurity"
-        if 'sucuri' in body_lower:
-            return "Sucuri"
         if 'blocked' in body_lower:
             return "Generic WAF"
     return None
 
 
-# ─────────────────────────────────────────────────────────────────────
-#  AsyncReconEngine (نسخة أصلية مع إضافة request_raw فقط)
-# ─────────────────────────────────────────────────────────────────────
 class AsyncReconEngine:
     def __init__(self,
                  max_concurrent: int = 30,
@@ -110,7 +96,6 @@ class AsyncReconEngine:
         self.delay_range = delay_range
         self.timeout = timeout
         self.user_agent_rotation = user_agent_rotation
-
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.session: Optional[ClientSession] = None
         self.connector: Optional[TCPConnector] = None
@@ -120,7 +105,6 @@ class AsyncReconEngine:
             'requests_failed': 0,
             'total_time': 0.0,
         }
-
         self.user_agents = [
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
@@ -186,7 +170,6 @@ class AsyncReconEngine:
         if self.enable_stealth and not self.internal_mode:
             await asyncio.sleep(random.uniform(*self.delay_range))
 
-    # ================== الطلب العادي (نسخة أصلية) ==================
     async def request(self,
                       url: str,
                       method: str = 'GET',
@@ -265,7 +248,6 @@ class AsyncReconEngine:
                 self._update_stats(time.perf_counter() - start, False)
                 return _empty_response(url, f"Error: {e}")
 
-    # ================== الطلب مع التبديل بين البروتوكولات (أصلي) ==================
     async def request_with_fallback(self,
                                      target: str,
                                      www_fallback: bool = True,
@@ -292,7 +274,6 @@ class AsyncReconEngine:
 
         return _empty_response(target, "Unreachable"), '', host
 
-    # ================== حل أسماء النطاقات ==================
     async def resolve_hostname(self, hostname: str) -> Optional[str]:
         try:
             loop = asyncio.get_event_loop()
@@ -302,94 +283,3 @@ class AsyncReconEngine:
         except:
             pass
         return None
-
-    # ================== الطلب الخام (لاختبارات HTTP Smuggling) ==================
-    async def request_raw(self,
-                          host: str,
-                          port: int,
-                          path: str,
-                          method: str = 'GET',
-                          headers: Optional[Dict] = None,
-                          data: Optional[str] = None,
-                          use_https: bool = True,
-                          timeout: float = 10.0) -> Optional[ResponseData]:
-        """
-        إرسال طلب HTTP خام عبر TCP (مخصص لاختبارات smuggling).
-        """
-        try:
-            reader, writer = await asyncio.open_connection(host, port, ssl=use_https)
-
-            # بناء الطلب
-            request_line = f"{method} {path} HTTP/1.1\r\n"
-            headers_dict = headers or {}
-            headers_dict.setdefault('Host', host)
-            headers_dict.setdefault('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
-            headers_dict.setdefault('Accept', '*/*')
-            headers_dict.setdefault('Connection', 'close')
-
-            header_lines = [f"{k}: {v}" for k, v in headers_dict.items()]
-            request = request_line + "\r\n".join(header_lines) + "\r\n\r\n"
-
-            if data:
-                if isinstance(data, str):
-                    data_bytes = data.encode('utf-8')
-                else:
-                    data_bytes = data
-                request_bytes = request.encode('utf-8') + data_bytes
-            else:
-                request_bytes = request.encode('utf-8')
-
-            start = time.perf_counter()
-            writer.write(request_bytes)
-            await writer.drain()
-
-            response_data = b''
-            try:
-                async def read_all():
-                    nonlocal response_data
-                    while True:
-                        chunk = await reader.read(8192)
-                        if not chunk:
-                            break
-                        response_data += chunk
-                await asyncio.wait_for(read_all(), timeout)
-            except asyncio.TimeoutError:
-                pass
-
-            writer.close()
-            await writer.wait_closed()
-            elapsed = time.perf_counter() - start
-
-            if not response_data:
-                return _empty_response(f"{host}:{port}{path}", "Empty response")
-
-            response_text = response_data.decode('utf-8', errors='ignore')
-            parts = response_text.split('\r\n\r\n', 1)
-            headers_text = parts[0]
-            body = parts[1] if len(parts) > 1 else ''
-
-            header_lines = headers_text.split('\r\n')
-            status_line = header_lines[0]
-            status_code = 0
-            if ' ' in status_line:
-                try:
-                    status_code = int(status_line.split(' ')[1])
-                except:
-                    pass
-
-            headers_dict = {}
-            for line in header_lines[1:]:
-                if ': ' in line:
-                    k, v = line.split(': ', 1)
-                    headers_dict[k.lower()] = v
-
-            return ResponseData(
-                url=f"{'https' if use_https else 'http'}://{host}:{port}{path}",
-                status=status_code,
-                headers=headers_dict,
-                body=body,
-                elapsed=elapsed,
-                method=method,
-            )
-        except Exception as e:
-            return _empty_response(f"{host}:{port}{path}", str(e))
