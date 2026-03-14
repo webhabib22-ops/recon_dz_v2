@@ -6,7 +6,33 @@ RECON-DZ v3 - Intelligence Engine  ★ NEVER SEEN BEFORE
 الفكرة الجوهرية:
   بدلاً من مجرد جمع المعلومات، هذا المحرك يفكر مثل المهاجم الحقيقي.
   يربط النقاط بين كل المعلومات المجمعة ويستنتج:
-  ...
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  BEHAVIORAL FINGERPRINTING  ←  الفكرة التي لم يفعلها أحد      │
+  │                                                                 │
+  │  نحلل سلوك السيرفر تحت ظروف مختلفة:                           │
+  │  • كيف يتصرف مع headers مشوهة؟                                 │
+  │  • أين تختفي الفروق بين WAF وراء الخادم الحقيقي؟              │
+  │  • ما الذي يكشفه الخطأ 404 مقارنة بـ 403 في مسارات محددة؟    │
+  │  • HTTP/1.0 vs HTTP/1.1 vs HTTP/2 — هل يختلف الرد؟           │
+  │  • هل الـ cache يكشف headers داخلية؟                           │
+  │  • هل chunked encoding يغير سلوك الـ WAF؟                     │
+  │  • هل هناك race condition في أوقات الاستجابة؟                  │
+  │  • ما الذي يكشفه timing attack في المسارات السرية؟             │
+  └─────────────────────────────────────────────────────────────────┘
+
+  ثم يولّد ATTACK SURFACE MAP — خريطة سطح الهجوم الكاملة مع:
+  - ترتيب الثغرات حسب احتمالية النجاح REAL
+  - تسلسل الهجوم المنطقي (attack chain)
+  - نقاط التحايل على الحماية
+  - توصيات الدفاع بنفس الدقة
+
+الفرق عن كل الأدوات الموجودة:
+  - Nmap     : يكشف المنافذ فقط
+  - Burp     : يحتاج proxy يدوي
+  - Nikto    : ضوضاء عالية، يُكشف فوراً
+  - OpenVAS  : ثقيل جداً، يحتاج installation
+  - RECON-DZ : passive + behavioral + intelligent + chained, لا يُكشف
 """
 
 import asyncio
@@ -48,9 +74,12 @@ class AttackVector:
     confidence:  float  # 0.0 → 1.0
     evidence:    List[str] = field(default_factory=list)
     bypass_hint: Optional[str] = None
-    chain_next:  List[str] = field(default_factory=list)
+    chain_next:  List[str] = field(default_factory=list)   # IDs or names of possible next vectors
     cve_hints:   List[str] = field(default_factory=list)
     defense:     str = ""
+    # NEW: link to other vectors for chaining
+    dependencies: List[str] = field(default_factory=list)   # what must be true for this vector
+    leads_to:    List[str] = field(default_factory=list)   # what can be achieved after this
 
     def to_dict(self) -> Dict:
         return self.__dict__
@@ -631,7 +660,7 @@ class AttackSurfaceMapper:
     """
     يأخذ جميع المعلومات المجمعة ويولّد:
     1. قائمة AttackVectors مرتبة حسب احتمالية النجاح
-    2. Attack chains (تسلسل الهجوم)
+    2. Attack chains (تسلسل الهجوم) – محسّن لربط الثغرات
     3. Defense recommendations
     """
 
@@ -641,10 +670,8 @@ class AttackSurfaceMapper:
                 vuln_findings: List,
                 server_fp:   Dict,
                 open_ports:  List[Dict],
-                subdomains:  List) -> List[AttackVector]:
-        """
-        subdomains: قائمة تحتوي إما نصوصًا (أسماء نطاقات) أو قواميس تحتوي مفتاح 'domain'
-        """
+                subdomains:  List[str]) -> List[AttackVector]:
+
         vectors: List[AttackVector] = []
 
         vectors.extend(self._from_behavior(behavior))
@@ -652,6 +679,9 @@ class AttackSurfaceMapper:
         vectors.extend(self._from_ports(open_ports))
         vectors.extend(self._from_subdomains(subdomains))
         vectors.extend(self._from_server_fp(server_fp))
+
+        # NEW: enrich vectors with leads_to based on common patterns
+        self._enrich_chains(vectors)
 
         # ترتيب: severity أولاً ثم confidence
         _sev = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
@@ -672,7 +702,7 @@ class AttackSurfaceMapper:
                 confidence=0.95,
                 evidence=['Access-Control-Allow-Origin: * detected'],
                 defense='Restrict CORS to trusted origins only.',
-                chain_next=['credential_theft', 'api_abuse'],
+                leads_to=['credential_theft', 'api_abuse'],
             ))
 
         if mb.get('xst_vulnerable'):
@@ -693,7 +723,7 @@ class AttackSurfaceMapper:
                 confidence=0.85,
                 evidence=[mb['arbitrary_write']],
                 defense='Disable PUT method unless required.',
-                chain_next=['rce_via_webshell'],
+                leads_to=['rce_via_webshell'],
             ))
 
         # Header manipulation anomalies
@@ -707,7 +737,7 @@ class AttackSurfaceMapper:
                 evidence=[hm['host_header_injection']],
                 bypass_hint='Use Host: evil.com to poison cache or trigger SSRF',
                 defense='Validate Host header against whitelist.',
-                chain_next=['cache_poisoning', 'ssrf'],
+                leads_to=['cache_poisoning', 'ssrf'],
             ))
 
         if hm.get('cache_poisoning_risk'):
@@ -718,7 +748,7 @@ class AttackSurfaceMapper:
                 confidence=0.9,
                 evidence=[hm['cache_poisoning_risk']],
                 defense='Strip unrecognized forwarding headers at edge.',
-                chain_next=['reflected_xss_via_cache'],
+                leads_to=['reflected_xss_via_cache'],
             ))
 
         # Cache behavior
@@ -744,7 +774,7 @@ class AttackSurfaceMapper:
                 evidence=[pq['te_cl_desync']],
                 bypass_hint='TE-CL desync may bypass WAF and reach backend directly',
                 defense='Normalize TE/CL headers at reverse proxy.',
-                chain_next=['waf_bypass', 'cache_deception'],
+                leads_to=['waf_bypass', 'cache_deception'],
                 cve_hints=['CVE-2020-11724', 'CVE-2019-18277'],
             ))
 
@@ -925,7 +955,7 @@ class AttackSurfaceMapper:
                 evidence=[f'Admin at {admin_paths[name]}'],
                 bypass_hint='Try default credentials, bruteforce, or auth bypass CVEs',
                 defense=f'Restrict {admin_paths[name]} to trusted IPs.',
-                chain_next=['credential_brute_force', 'auth_bypass'],
+                leads_to=['credential_brute_force', 'auth_bypass'],
             ))
 
         return vectors
@@ -960,11 +990,7 @@ class AttackSurfaceMapper:
                 ))
         return vectors
 
-    def _from_subdomains(self, subs: List) -> List[AttackVector]:
-        """
-        توليد AttackVectors من قائمة النطاقات الفرعية.
-        يدخل subs قائمة قد تحتوي على نصوص أو قواميس بمفتاح 'domain'.
-        """
+    def _from_subdomains(self, subs: List[str]) -> List[AttackVector]:
         vectors: List[AttackVector] = []
         risky_keywords = {
             'dev':      ('Development Environment Exposed', 'high'),
@@ -982,28 +1008,18 @@ class AttackSurfaceMapper:
             'grafana':  ('Grafana Exposed', 'high'),
             'kibana':   ('Kibana Exposed', 'critical'),
         }
-
         for sub in subs:
-            # استخراج اسم النطاق إذا كان العنصر قاموسًا
-            if isinstance(sub, dict):
-                domain = sub.get('domain', '')
-                if not domain:
-                    continue
-            else:
-                domain = str(sub)
-
-            domain_lower = domain.lower()
             for kw, (name, sev) in risky_keywords.items():
-                if kw in domain_lower:
+                if kw in sub.lower():
                     vectors.append(AttackVector(
-                        name=f'{name}: {domain}',
+                        name=f'{name}: {sub}',
                         category='misconfig',
                         severity=sev,
                         confidence=0.7,
-                        evidence=[f'Subdomain {domain} contains keyword "{kw}"'],
-                        defense=f'Remove or restrict access to {domain} if not needed.',
+                        evidence=[f'Subdomain {sub} contains keyword "{kw}"'],
+                        defense=f'Remove or restrict access to {sub} if not needed.',
                     ))
-                    break  # أول كلمة تظهر تكفي
+                    break
         return vectors
 
     def _from_server_fp(self, fp: Dict) -> List[AttackVector]:
@@ -1025,6 +1041,60 @@ class AttackSurfaceMapper:
             ))
 
         return vectors
+
+    # =============== NEW: Chain Enrichment ===============
+    def _enrich_chains(self, vectors: List[AttackVector]) -> None:
+        """
+        ربط الثغرات ببعضها لتشكيل سلاسل هجوم حقيقية.
+        تعديل leads_to لكل vector بناءً على معرفة مسبقة.
+        """
+        # Create a name->index map for quick lookup
+        name_to_vec = {v.name: v for v in vectors}
+
+        # Define common chains
+        chain_rules = [
+            # Directory listing → backup file → .env → credentials
+            {
+                'trigger': 'Directory Listing Enabled',
+                'targets': ['Exposed Sensitive File', 'Legacy Source File Exposed']
+            },
+            {
+                'trigger': 'Exposed Sensitive File',
+                'condition': lambda v: 'backup' in v.name.lower() or '.sql' in v.name,
+                'targets': ['Database Connection String Exposed', 'Password Disclosed in Page']
+            },
+            # Timing anomaly → blind injection
+            {
+                'trigger': 'Timing Anomaly — Hidden Path',
+                'targets': ['Potential Blind Injection (Timing)']
+            },
+            # WAF bypass surfaces
+            {
+                'trigger': 'HTTP Request Smuggling Surface',
+                'targets': ['WAF Bypass → Direct Exploit']
+            },
+            {
+                'trigger': 'Encoding Bypass Surface',
+                'targets': ['WAF Bypass → Direct Exploit']
+            },
+            # CMS vulns
+            {
+                'trigger': 'WordPress — SQL Injection in WP_Query',
+                'targets': ['Database Connection String Exposed']
+            },
+        ]
+
+        for rule in chain_rules:
+            trigger_name = rule['trigger']
+            if trigger_name in name_to_vec:
+                trigger = name_to_vec[trigger_name]
+                # Check condition if any
+                if 'condition' in rule and not rule['condition'](trigger):
+                    continue
+                for target_name in rule['targets']:
+                    if target_name in name_to_vec and target_name not in trigger.leads_to:
+                        trigger.leads_to.append(target_name)
+    # =======================================================
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1050,7 +1120,7 @@ class IntelligenceEngine:
                       vuln_findings: Optional[List]       = None,
                       server_fp:    Optional[Dict]        = None,
                       open_ports:   Optional[List[Dict]]  = None,
-                      subdomains:   Optional[List]        = None,
+                      subdomains:   Optional[List[str]]   = None,
                       ) -> Dict[str, Any]:
         """
         تشغيل التحليل الكامل.
@@ -1073,8 +1143,8 @@ class IntelligenceEngine:
             subdomains   = subdomains or [],
         )
 
-        # Attack chain builder
-        chains = _build_attack_chains(vectors)
+        # Attack chain builder (enhanced)
+        chains = self._build_advanced_attack_chains(vectors)
 
         # Risk score
         risk = _calculate_risk_score(vectors)
@@ -1097,6 +1167,81 @@ class IntelligenceEngine:
             'medium':        sum(1 for v in vectors if v.severity == 'medium'),
             'low':           sum(1 for v in vectors if v.severity == 'low'),
         }
+
+    # =============== NEW: Advanced Chain Builder ===============
+    def _build_advanced_attack_chains(self, vectors: List[AttackVector]) -> List[Dict]:
+        """
+        يبني سلاسل هجوم أكثر ذكاءً باستخدام leads_to.
+        """
+        chains = []
+        # تجميع السلاسل من leads_to
+        name_to_vec = {v.name: v for v in vectors}
+
+        # بدء من أي vector ليس لديه من يشير إليه
+        for v in vectors:
+            if v.leads_to:
+                chain = {
+                    'name': f'Chain from {v.name}',
+                    'steps': [v.name],
+                    'likelihood': 'MEDIUM',
+                }
+                current = v
+                while current.leads_to:
+                    # خذ أول target
+                    next_name = current.leads_to[0]
+                    if next_name in name_to_vec:
+                        current = name_to_vec[next_name]
+                        chain['steps'].append(current.name)
+                    else:
+                        break
+                if len(chain['steps']) > 1:
+                    # تقدير الاحتمالية بناءً على أوثق خطوة
+                    chain['likelihood'] = 'HIGH' if v.confidence > 0.8 else 'MEDIUM'
+                    chains.append(chain)
+
+        # أيضاً السلاسل اليدوية الموجودة سابقاً
+        # (نحتفظ بها)
+        has_info_leak  = any(v.category == 'info_leak' for v in vectors)
+        has_auth       = any(v.category == 'auth_bypass' for v in vectors)
+        has_injection  = any(v.category == 'injection'  for v in vectors)
+        has_misconfig  = any(v.category == 'misconfig'  for v in vectors)
+
+        if has_info_leak and has_injection:
+            chains.append({
+                'name':  'Recon → Exploit Chain',
+                'steps': [
+                    'Information disclosure reveals backend technology/version',
+                    'Known CVE identified for discovered version',
+                    'Exploit via injection vulnerability',
+                ],
+                'likelihood': 'HIGH',
+            })
+
+        if has_misconfig and has_auth:
+            chains.append({
+                'name':  'Misconfiguration → Privilege Escalation',
+                'steps': [
+                    'Misconfigured access controls discovered',
+                    'Admin panel accessible from internet',
+                    'Bruteforce or default credentials attempt',
+                    'Full admin access obtained',
+                ],
+                'likelihood': 'HIGH',
+            })
+
+        if has_injection:
+            chains.append({
+                'name':  'WAF Bypass → Direct Exploit',
+                'steps': [
+                    'Behavioral analysis reveals WAF/backend discrepancy',
+                    'Encoding bypass or HTTP smuggling identified',
+                    'Payload reaches backend unfiltered',
+                ],
+                'likelihood': 'MEDIUM',
+            })
+
+        return chains
+    # ============================================================
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1152,54 +1297,6 @@ def _extract_personality(behavior: Dict, server_fp: Dict) -> ServerPersonality:
             p.true_server = 'Apache (via header)'
 
     return p
-
-
-def _build_attack_chains(vectors: List[AttackVector]) -> List[Dict]:
-    """
-    يبني تسلسلات هجوم منطقية من العلاقات بين الـ vectors.
-    """
-    chains = []
-    # chain: info_leak → credential_attack → rce
-    has_info_leak  = any(v.category == 'info_leak' for v in vectors)
-    has_auth       = any(v.category == 'auth_bypass' for v in vectors)
-    has_injection  = any(v.category == 'injection'  for v in vectors)
-    has_misconfig  = any(v.category == 'misconfig'  for v in vectors)
-
-    if has_info_leak and has_injection:
-        chains.append({
-            'name':  'Recon → Exploit Chain',
-            'steps': [
-                'Information disclosure reveals backend technology/version',
-                'Known CVE identified for discovered version',
-                'Exploit via injection vulnerability',
-            ],
-            'likelihood': 'HIGH',
-        })
-
-    if has_misconfig and has_auth:
-        chains.append({
-            'name':  'Misconfiguration → Privilege Escalation',
-            'steps': [
-                'Misconfigured access controls discovered',
-                'Admin panel accessible from internet',
-                'Bruteforce or default credentials attempt',
-                'Full admin access obtained',
-            ],
-            'likelihood': 'HIGH',
-        })
-
-    if has_injection:
-        chains.append({
-            'name':  'WAF Bypass → Direct Exploit',
-            'steps': [
-                'Behavioral analysis reveals WAF/backend discrepancy',
-                'Encoding bypass or HTTP smuggling identified',
-                'Payload reaches backend unfiltered',
-            ],
-            'likelihood': 'MEDIUM',
-        })
-
-    return chains
 
 
 def _calculate_risk_score(vectors: List[AttackVector]) -> int:
