@@ -208,7 +208,7 @@ class AsyncReconEngine:
             delay = random.uniform(self.delay_range[0], self.delay_range[1])
             await asyncio.sleep(delay)
 
-    # =============== الطلب العادي مع إعادة محاولة بسيطة ===============
+    # =============== الطلب العادي (بدون إعادة محاولة) ===============
     async def request(self,
                       url: str,
                       method: str = 'GET',
@@ -217,7 +217,7 @@ class AsyncReconEngine:
                       follow_redirects: bool = True,
                       max_redirects: int = 5) -> ResponseData:
         """
-        إرسال طلب HTTP مع محاولة واحدة فقط (بدون إعادة محاولة معقدة لتجنب التأخير).
+        إرسال طلب HTTP مع محاولة واحدة فقط.
         """
         if not self.session:
             await self.initialize()
@@ -229,6 +229,7 @@ class AsyncReconEngine:
             redirect_count = 0
             current_url = url
             final_resp: Optional[ResponseData] = None
+            last_error: Optional[str] = None
 
             try:
                 while True:
@@ -338,12 +339,15 @@ class AsyncReconEngine:
 
             response_data = b''
             try:
-                async with asyncio.timeout(timeout):
+                # استخدام wait_for للتوافق مع Python < 3.11
+                async def read_all():
+                    nonlocal response_data
                     while True:
                         chunk = await reader.read(8192)
                         if not chunk:
                             break
                         response_data += chunk
+                await asyncio.wait_for(read_all(), timeout)
             except asyncio.TimeoutError:
                 pass
 
@@ -395,13 +399,16 @@ class AsyncReconEngine:
             pass
         return None
 
+    # =============== الطلب مع التبديل بين البروتوكولات ===============
     async def request_with_fallback(self,
                                      target: str,
                                      www_fallback: bool = True,
                                      path: str = '/') -> Tuple[ResponseData, str, str]:
         """
         محاولة الاتصال بالهدف مع تبديل البروتوكول وإضافة www.
+        تعيد (أول استجابة ناجحة, البروتوكول المستخدم, الهوست المستخدم).
         """
+        # تنظيف الهدف
         if not target.startswith('http'):
             target = 'http://' + target
 
@@ -410,20 +417,27 @@ class AsyncReconEngine:
         if not host:
             host = target
 
+        # إزالة www إن وجدت
         if host.startswith('www.'):
             host = host[4:]
 
+        # قائمة البروتوكولات والهوستات
         protocols = ['https://', 'http://']
         hosts = [host]
         if www_fallback:
             hosts.append(f'www.{host}')
 
+        # تجربة كل الاحتمالات
+        last_error = ""
         for proto in protocols:
             for h in hosts:
                 url = f"{proto}{h}{path}"
                 resp = await self.request(url, follow_redirects=True)
                 if resp.status != 0:
+                    # نجح الاتصال (حتى لو كان 4xx)
                     return resp, proto, h
+                else:
+                    last_error = resp.error
 
-        # فشل كل المحاولات
-        return _empty_response(target, "Unreachable after all attempts"), '', host
+        # إذا فشل الجميع، نعيد استجابة خطأ مع آخر خطأ
+        return _empty_response(target, f"Unreachable: {last_error}"), '', host
