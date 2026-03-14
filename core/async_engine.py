@@ -3,23 +3,20 @@
 """
 RECON-DZ v3 - Async HTTP Engine
 ================================
-محرك الطلبات غير المتزامن مع دعم تقنيات التخفي والمراوغة.
+محرك الطلبات غير المتزامن (نسخة مستقرة مع دالة request_raw فقط)
 """
 
 import asyncio
 import aiohttp
 import socket
-import ssl
 import random
 import time
 import re
 from typing import Dict, List, Optional, Tuple, Any
 from urllib.parse import urlparse
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
 
 try:
-    import aiohttp
     from aiohttp import ClientTimeout, ClientSession, TCPConnector
 except ImportError:
     print("[!] aiohttp غير مثبت. يرجى تثبيته: pip install aiohttp")
@@ -42,9 +39,9 @@ class ResponseData:
     method: str = "GET"
 
     def get_header(self, name: str, default: str = "") -> str:
-        lower_name = name.lower()
+        lower = name.lower()
         for k, v in self.headers.items():
-            if k.lower() == lower_name:
+            if k.lower() == lower:
                 return v
         return default
 
@@ -62,17 +59,10 @@ class ResponseData:
         cf = self.get_header('cf-ray')
         if cf:
             hints.append("cloudflare")
-        akamai = self.get_header('akamai-grn')
-        if akamai:
-            hints.append("akamai")
         if self.body:
             lower = self.body.lower()
             if 'wp-content' in lower or 'wp-includes' in lower:
                 hints.append("cms:wordpress")
-            elif 'joomla' in lower:
-                hints.append("cms:joomla")
-            elif 'drupal' in lower:
-                hints.append("cms:drupal")
         return hints
 
     @property
@@ -81,12 +71,7 @@ class ResponseData:
 
 
 def _empty_response(url: str, error: str = "") -> ResponseData:
-    return ResponseData(
-        url=url,
-        status=0,
-        headers={},
-        error=error
-    )
+    return ResponseData(url=url, status=0, headers={}, error=error)
 
 
 def detect_waf_response(resp: ResponseData) -> Optional[str]:
@@ -97,23 +82,19 @@ def detect_waf_response(resp: ResponseData) -> Optional[str]:
             return "Cloudflare"
         if 'x-amzn-requestid' in hdr_str:
             return "AWS WAF"
-        if 'incap_ses' in hdr_str or 'x-iinfo' in hdr_str:
+        if 'incap_ses' in hdr_str:
             return "Imperva"
-        if 'mod_security' in body_lower or 'x-modsecurity' in hdr_str:
+        if 'mod_security' in body_lower:
             return "ModSecurity"
-        if 'sucuri' in body_lower or 'x-sucuri-id' in hdr_str:
+        if 'sucuri' in body_lower:
             return "Sucuri"
-        if 'fortigate' in body_lower:
-            return "Fortinet"
-        if 'akamai' in body_lower or 'ak_bmsc' in hdr_str:
-            return "Akamai"
-        if 'blocked' in body_lower or 'security policy' in body_lower:
+        if 'blocked' in body_lower:
             return "Generic WAF"
     return None
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  AsyncReconEngine
+#  AsyncReconEngine (نسخة أصلية مع إضافة request_raw فقط)
 # ─────────────────────────────────────────────────────────────────────
 class AsyncReconEngine:
     def __init__(self,
@@ -144,11 +125,10 @@ class AsyncReconEngine:
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
             'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
         ]
 
     async def initialize(self):
-        if self.session is not None:
+        if self.session:
             return
         self.connector = TCPConnector(
             limit=self.max_concurrent,
@@ -160,7 +140,7 @@ class AsyncReconEngine:
         self.session = ClientSession(
             connector=self.connector,
             timeout=timeout,
-            headers=self._get_base_headers()
+            headers=self._base_headers()
         )
 
     async def close(self):
@@ -171,12 +151,11 @@ class AsyncReconEngine:
             await self.connector.close()
             self.connector = None
 
-    def _get_base_headers(self) -> Dict[str, str]:
+    def _base_headers(self) -> Dict[str, str]:
         headers = {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
             'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
         }
         if self.user_agent_rotation:
             headers['User-Agent'] = random.choice(self.user_agents)
@@ -203,46 +182,38 @@ class AsyncReconEngine:
             'success_rate_pct': round(self.stats['requests_success'] / max(total, 1) * 100, 1),
         }
 
-    async def _apply_stealth_delay(self):
+    async def _delay(self):
         if self.enable_stealth and not self.internal_mode:
-            delay = random.uniform(self.delay_range[0], self.delay_range[1])
-            await asyncio.sleep(delay)
+            await asyncio.sleep(random.uniform(*self.delay_range))
 
-    # =============== الطلب العادي (بدون إعادة محاولة) ===============
+    # ================== الطلب العادي (نسخة أصلية) ==================
     async def request(self,
                       url: str,
                       method: str = 'GET',
                       headers: Optional[Dict] = None,
-                      data: Optional[Any] = None,
+                      data: Any = None,
                       follow_redirects: bool = True,
                       max_redirects: int = 5) -> ResponseData:
-        """
-        إرسال طلب HTTP مع محاولة واحدة فقط.
-        """
         if not self.session:
             await self.initialize()
 
-        await self._apply_stealth_delay()
+        await self._delay()
 
         async with self.semaphore:
             start = time.perf_counter()
-            redirect_count = 0
-            current_url = url
-            final_resp: Optional[ResponseData] = None
-            last_error: Optional[str] = None
+            redirects = 0
+            current = url
+            final = None
 
             try:
                 while True:
-                    req_headers = self._get_base_headers()
+                    req_headers = self._base_headers()
                     if headers:
                         req_headers.update(headers)
 
-                    if 'Content-Length' in req_headers and data is None:
-                        del req_headers['Content-Length']
-
                     async with self.session.request(
                         method=method,
-                        url=current_url,
+                        url=current,
                         headers=req_headers,
                         data=data,
                         allow_redirects=False,
@@ -250,11 +221,10 @@ class AsyncReconEngine:
                     ) as resp:
                         body = await resp.text(encoding='utf-8', errors='ignore')
                         headers_dict = dict(resp.headers)
-                        status = resp.status
 
                         response = ResponseData(
                             url=str(resp.url),
-                            status=status,
+                            status=resp.status,
                             headers=headers_dict,
                             body=body,
                             elapsed=time.perf_counter() - start,
@@ -262,28 +232,28 @@ class AsyncReconEngine:
                             method=method,
                         )
 
-                        if follow_redirects and status in (301, 302, 303, 307, 308):
+                        if follow_redirects and resp.status in (301, 302, 303, 307, 308):
                             location = headers_dict.get('location')
-                            if location and redirect_count < max_redirects:
+                            if location and redirects < max_redirects:
                                 if location.startswith('http'):
-                                    current_url = location
+                                    current = location
                                 else:
-                                    parsed = urlparse(current_url)
+                                    parsed = urlparse(current)
                                     base = f"{parsed.scheme}://{parsed.netloc}"
-                                    current_url = base + location
-                                redirect_count += 1
+                                    current = base + location
+                                redirects += 1
                                 continue
-                        final_resp = response
+                        final = response
                         break
 
-                if final_resp is None:
-                    final_resp = _empty_response(url, "No response")
+                if final is None:
+                    final = _empty_response(url, "No response")
                 else:
-                    final_resp.redirect_count = redirect_count
+                    final.redirect_count = redirects
 
-                success = 200 <= final_resp.status < 400
+                success = 200 <= final.status < 400
                 self._update_stats(time.perf_counter() - start, success)
-                return final_resp
+                return final
 
             except asyncio.TimeoutError:
                 self._update_stats(time.perf_counter() - start, False)
@@ -291,14 +261,49 @@ class AsyncReconEngine:
             except aiohttp.ClientConnectorError as e:
                 self._update_stats(time.perf_counter() - start, False)
                 return _empty_response(url, f"Connection error: {e}")
-            except aiohttp.ClientResponseError as e:
-                self._update_stats(time.perf_counter() - start, False)
-                return _empty_response(url, f"HTTP error: {e}")
             except Exception as e:
                 self._update_stats(time.perf_counter() - start, False)
-                return _empty_response(url, f"Unexpected: {e}")
+                return _empty_response(url, f"Error: {e}")
 
-    # =============== الطلب الخام (لـ HTTP Smuggling) ===============
+    # ================== الطلب مع التبديل بين البروتوكولات (أصلي) ==================
+    async def request_with_fallback(self,
+                                     target: str,
+                                     www_fallback: bool = True,
+                                     path: str = '/') -> Tuple[ResponseData, str, str]:
+        if not target.startswith('http'):
+            target = 'http://' + target
+
+        parsed = urlparse(target)
+        host = parsed.netloc or parsed.path.split('/')[0]
+        if host.startswith('www.'):
+            host = host[4:]
+
+        protocols = ['https://', 'http://']
+        hosts = [host]
+        if www_fallback:
+            hosts.append(f'www.{host}')
+
+        for proto in protocols:
+            for h in hosts:
+                url = f"{proto}{h}{path}"
+                resp = await self.request(url, follow_redirects=True)
+                if resp.status != 0:
+                    return resp, proto, h
+
+        return _empty_response(target, "Unreachable"), '', host
+
+    # ================== حل أسماء النطاقات ==================
+    async def resolve_hostname(self, hostname: str) -> Optional[str]:
+        try:
+            loop = asyncio.get_event_loop()
+            ips = await loop.getaddrinfo(hostname, None, family=socket.AF_INET)
+            if ips:
+                return ips[0][4][0]
+        except:
+            pass
+        return None
+
+    # ================== الطلب الخام (لاختبارات HTTP Smuggling) ==================
     async def request_raw(self,
                           host: str,
                           port: int,
@@ -309,11 +314,12 @@ class AsyncReconEngine:
                           use_https: bool = True,
                           timeout: float = 10.0) -> Optional[ResponseData]:
         """
-        إرسال طلب HTTP خام عبر TCP (لاختبارات التهريب).
+        إرسال طلب HTTP خام عبر TCP (مخصص لاختبارات smuggling).
         """
         try:
             reader, writer = await asyncio.open_connection(host, port, ssl=use_https)
 
+            # بناء الطلب
             request_line = f"{method} {path} HTTP/1.1\r\n"
             headers_dict = headers or {}
             headers_dict.setdefault('Host', host)
@@ -339,7 +345,6 @@ class AsyncReconEngine:
 
             response_data = b''
             try:
-                # استخدام wait_for للتوافق مع Python < 3.11
                 async def read_all():
                     nonlocal response_data
                     while True:
@@ -388,56 +393,3 @@ class AsyncReconEngine:
             )
         except Exception as e:
             return _empty_response(f"{host}:{port}{path}", str(e))
-
-    async def resolve_hostname(self, hostname: str) -> Optional[str]:
-        try:
-            loop = asyncio.get_event_loop()
-            ips = await loop.getaddrinfo(hostname, None, family=socket.AF_INET)
-            if ips:
-                return ips[0][4][0]
-        except Exception:
-            pass
-        return None
-
-    # =============== الطلب مع التبديل بين البروتوكولات ===============
-    async def request_with_fallback(self,
-                                     target: str,
-                                     www_fallback: bool = True,
-                                     path: str = '/') -> Tuple[ResponseData, str, str]:
-        """
-        محاولة الاتصال بالهدف مع تبديل البروتوكول وإضافة www.
-        تعيد (أول استجابة ناجحة, البروتوكول المستخدم, الهوست المستخدم).
-        """
-        # تنظيف الهدف
-        if not target.startswith('http'):
-            target = 'http://' + target
-
-        parsed = urlparse(target)
-        host = parsed.netloc or parsed.path.split('/')[0]
-        if not host:
-            host = target
-
-        # إزالة www إن وجدت
-        if host.startswith('www.'):
-            host = host[4:]
-
-        # قائمة البروتوكولات والهوستات
-        protocols = ['https://', 'http://']
-        hosts = [host]
-        if www_fallback:
-            hosts.append(f'www.{host}')
-
-        # تجربة كل الاحتمالات
-        last_error = ""
-        for proto in protocols:
-            for h in hosts:
-                url = f"{proto}{h}{path}"
-                resp = await self.request(url, follow_redirects=True)
-                if resp.status != 0:
-                    # نجح الاتصال (حتى لو كان 4xx)
-                    return resp, proto, h
-                else:
-                    last_error = resp.error
-
-        # إذا فشل الجميع، نعيد استجابة خطأ مع آخر خطأ
-        return _empty_response(target, f"Unreachable: {last_error}"), '', host
