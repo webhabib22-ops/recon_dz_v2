@@ -74,7 +74,7 @@ class AttackVector:
     confidence:  float  # 0.0 → 1.0
     evidence:    List[str] = field(default_factory=list)
     bypass_hint: Optional[str] = None
-    chain_next:  List[str] = field(default_factory=list)   # IDs or names of possible next vectors
+    chain_next:  List[str] = field(default_factory=list)
     cve_hints:   List[str] = field(default_factory=list)
     defense:     str = ""
     # NEW: link to other vectors for chaining
@@ -670,8 +670,10 @@ class AttackSurfaceMapper:
                 vuln_findings: List,
                 server_fp:   Dict,
                 open_ports:  List[Dict],
-                subdomains:  List[str]) -> List[AttackVector]:
-
+                subdomains:  List) -> List[AttackVector]:
+        """
+        subdomains: قائمة تحتوي إما نصوصًا (أسماء نطاقات) أو قواميس تحتوي مفتاح 'domain'
+        """
         vectors: List[AttackVector] = []
 
         vectors.extend(self._from_behavior(behavior))
@@ -702,7 +704,7 @@ class AttackSurfaceMapper:
                 confidence=0.95,
                 evidence=['Access-Control-Allow-Origin: * detected'],
                 defense='Restrict CORS to trusted origins only.',
-                leads_to=['credential_theft', 'api_abuse'],
+                chain_next=['credential_theft', 'api_abuse'],
             ))
 
         if mb.get('xst_vulnerable'):
@@ -723,7 +725,7 @@ class AttackSurfaceMapper:
                 confidence=0.85,
                 evidence=[mb['arbitrary_write']],
                 defense='Disable PUT method unless required.',
-                leads_to=['rce_via_webshell'],
+                chain_next=['rce_via_webshell'],
             ))
 
         # Header manipulation anomalies
@@ -737,7 +739,7 @@ class AttackSurfaceMapper:
                 evidence=[hm['host_header_injection']],
                 bypass_hint='Use Host: evil.com to poison cache or trigger SSRF',
                 defense='Validate Host header against whitelist.',
-                leads_to=['cache_poisoning', 'ssrf'],
+                chain_next=['cache_poisoning', 'ssrf'],
             ))
 
         if hm.get('cache_poisoning_risk'):
@@ -748,7 +750,7 @@ class AttackSurfaceMapper:
                 confidence=0.9,
                 evidence=[hm['cache_poisoning_risk']],
                 defense='Strip unrecognized forwarding headers at edge.',
-                leads_to=['reflected_xss_via_cache'],
+                chain_next=['reflected_xss_via_cache'],
             ))
 
         # Cache behavior
@@ -774,7 +776,7 @@ class AttackSurfaceMapper:
                 evidence=[pq['te_cl_desync']],
                 bypass_hint='TE-CL desync may bypass WAF and reach backend directly',
                 defense='Normalize TE/CL headers at reverse proxy.',
-                leads_to=['waf_bypass', 'cache_deception'],
+                chain_next=['waf_bypass', 'cache_deception'],
                 cve_hints=['CVE-2020-11724', 'CVE-2019-18277'],
             ))
 
@@ -955,7 +957,7 @@ class AttackSurfaceMapper:
                 evidence=[f'Admin at {admin_paths[name]}'],
                 bypass_hint='Try default credentials, bruteforce, or auth bypass CVEs',
                 defense=f'Restrict {admin_paths[name]} to trusted IPs.',
-                leads_to=['credential_brute_force', 'auth_bypass'],
+                chain_next=['credential_brute_force', 'auth_bypass'],
             ))
 
         return vectors
@@ -990,7 +992,11 @@ class AttackSurfaceMapper:
                 ))
         return vectors
 
-    def _from_subdomains(self, subs: List[str]) -> List[AttackVector]:
+    def _from_subdomains(self, subs: List) -> List[AttackVector]:
+        """
+        توليد AttackVectors من قائمة النطاقات الفرعية.
+        يدخل subs قائمة قد تحتوي على نصوص أو قواميس بمفتاح 'domain'.
+        """
         vectors: List[AttackVector] = []
         risky_keywords = {
             'dev':      ('Development Environment Exposed', 'high'),
@@ -1008,18 +1014,28 @@ class AttackSurfaceMapper:
             'grafana':  ('Grafana Exposed', 'high'),
             'kibana':   ('Kibana Exposed', 'critical'),
         }
+
         for sub in subs:
+            # استخراج اسم النطاق إذا كان العنصر قاموسًا
+            if isinstance(sub, dict):
+                domain = sub.get('domain', '')
+                if not domain:
+                    continue
+            else:
+                domain = str(sub)
+
+            domain_lower = domain.lower()
             for kw, (name, sev) in risky_keywords.items():
-                if kw in sub.lower():
+                if kw in domain_lower:
                     vectors.append(AttackVector(
-                        name=f'{name}: {sub}',
+                        name=f'{name}: {domain}',
                         category='misconfig',
                         severity=sev,
                         confidence=0.7,
-                        evidence=[f'Subdomain {sub} contains keyword "{kw}"'],
-                        defense=f'Remove or restrict access to {sub} if not needed.',
+                        evidence=[f'Subdomain {domain} contains keyword "{kw}"'],
+                        defense=f'Remove or restrict access to {domain} if not needed.',
                     ))
-                    break
+                    break  # أول كلمة تظهر تكفي
         return vectors
 
     def _from_server_fp(self, fp: Dict) -> List[AttackVector]:
@@ -1120,7 +1136,7 @@ class IntelligenceEngine:
                       vuln_findings: Optional[List]       = None,
                       server_fp:    Optional[Dict]        = None,
                       open_ports:   Optional[List[Dict]]  = None,
-                      subdomains:   Optional[List[str]]   = None,
+                      subdomains:   Optional[List]        = None,
                       ) -> Dict[str, Any]:
         """
         تشغيل التحليل الكامل.

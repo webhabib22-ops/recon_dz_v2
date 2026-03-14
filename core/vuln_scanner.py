@@ -56,6 +56,7 @@ class VulnScanner:
     """
 
     # Sensitive paths that should NOT be publicly accessible
+    # (Base list, will be extended dynamically if server technology is known)
     SENSITIVE_PATHS = [
         # Version control
         '/.git/HEAD', '/.git/config', '/.svn/entries',
@@ -164,9 +165,11 @@ class VulnScanner:
         self.engine = engine
 
     async def scan(self, base_url: str, main_response: ResponseData,
-                   algeria_info=None) -> List[Finding]:
+                   algeria_info=None, server_tech: Optional[Dict] = None) -> List[Finding]:
         """
         Run all vulnerability checks against base_url.
+        - algeria_info: object from AlgeriaThreatDatabase.identify_target()
+        - server_tech:  dict with detected technologies (e.g. {'server': 'Apache', 'php_version': '8.2'})
         Returns a list of Finding objects sorted by severity.
         """
         findings: List[Finding] = []
@@ -177,8 +180,8 @@ class VulnScanner:
         # 2. Server version disclosure
         findings.extend(self._check_version_disclosure(main_response))
 
-        # 3. Sensitive file exposure (concurrent)
-        file_findings = await self._check_sensitive_files(base_url)
+        # 3. Sensitive file exposure (concurrent) – with technology‑aware paths
+        file_findings = await self._check_sensitive_files(base_url, server_tech)
         findings.extend(file_findings)
 
         # 4. Directory listing
@@ -190,7 +193,7 @@ class VulnScanner:
         # 6. Cookie security flags
         findings.extend(self._check_cookie_flags(main_response))
 
-        # 7. Algeria-specific compliance
+        # 7. Algeria-specific compliance – FIX: safe access to attributes
         if algeria_info:
             findings.extend(self._check_algeria_compliance(main_response, algeria_info))
 
@@ -261,13 +264,33 @@ class VulnScanner:
                         ))
         return findings
 
-    async def _check_sensitive_files(self, base_url: str) -> List[Finding]:
+    async def _check_sensitive_files(self, base_url: str,
+                                      server_tech: Optional[Dict] = None) -> List[Finding]:
         """Check for exposed sensitive files concurrently."""
+        # Start with the base SENSITIVE_PATHS
+        paths_to_test = list(self.SENSITIVE_PATHS)
+
+        # --- Stack‑Specific Probing (point 2) ---
+        # If we know the server is Apache / PHP, add extra PHP‑specific paths
+        if server_tech:
+            server = server_tech.get('server', '').lower()
+            php_ver = server_tech.get('php_version', '')
+            if 'apache' in server or php_ver:
+                extra_php_paths = [
+                    '/phpinfo.php', '/info.php', '/test.php',
+                    '/.user.ini', '/php.ini', '/.htaccess',
+                    '/phpmyadmin/scripts/setup.php', '/pma/',
+                ]
+                # Avoid duplicates
+                for p in extra_php_paths:
+                    if p not in paths_to_test:
+                        paths_to_test.append(p)
+
         findings: List[Finding] = []
         sem   = asyncio.Semaphore(20)
         tasks = [
             self._probe_path(base_url, path, sem)
-            for path in self.SENSITIVE_PATHS
+            for path in paths_to_test
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for res in results:
@@ -385,7 +408,11 @@ class VulnScanner:
         """Check Algerian regulatory compliance requirements."""
         findings: List[Finding] = []
 
-        if algeria_info.is_government:
+        # FIX: Use getattr to avoid AttributeError when algeria_info lacks the attributes
+        is_gov = getattr(algeria_info, 'is_government', False)
+        is_bank = getattr(algeria_info, 'is_banking', False)
+
+        if is_gov:
             if not resp.get_header('strict-transport-security'):
                 findings.append(Finding(
                     name="Decree 26-07 Violation: No HSTS",
@@ -407,7 +434,7 @@ class VulnScanner:
                     compliance=['Decree_26_07_Article_12'],
                 ))
 
-        if algeria_info.is_banking:
+        if is_bank:
             if not resp.get_header('content-security-policy'):
                 findings.append(Finding(
                     name="PCI-DSS Violation: No Content Security Policy",
