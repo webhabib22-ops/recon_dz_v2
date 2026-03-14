@@ -14,6 +14,7 @@ import asyncio
 import time
 import json
 import re
+import random
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -51,9 +52,9 @@ class WAFProfile:
     probe_results:      List[WAFProbeResult] = field(default_factory=list)
     recommendations:    List[Dict]         = field(default_factory=list)
     timestamp:          str                = field(default_factory=lambda: datetime.now().isoformat())
-    # NEW: flag to indicate aggressive blocking (IP banned)
-    aggressive_block:   bool                = False
-    block_reason:       str                 = ""
+    # NEW: smuggling analysis results
+    smuggling_vulnerable: bool              = False
+    smuggling_details:    Dict[str, Any]    = field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -242,6 +243,8 @@ class WAFAnalyzer:
     - How quickly the WAF responds to attacks
     - Whether evasion techniques bypass detection
     - WAF identity and behavioral fingerprint
+    - NEW: HTTP Request Smuggling detection
+    - NEW: Behavioral mimicry (random delays, realistic headers)
 
     Use the WAFProfile output to harden your WAF ruleset.
     """
@@ -250,6 +253,30 @@ class WAFAnalyzer:
                  delay_between_probes: float = 0.3):
         self.engine  = engine
         self.delay   = delay_between_probes
+
+    # =============== NEW: Behavioral Mimicry ===============
+    def _add_realistic_headers(self, extra_headers: Dict) -> Dict:
+        """إضافة رؤوس عشوائية تحاكي متصفحاً حقيقياً."""
+        headers = extra_headers.copy()
+        # إضافة User-Agent عادي إذا لم يكن موجوداً
+        if 'User-Agent' not in headers:
+            ua_list = [
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+                'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+            ]
+            headers['User-Agent'] = random.choice(ua_list)
+        # إضافة Accept-Language عشوائي
+        if 'Accept-Language' not in headers:
+            headers['Accept-Language'] = random.choice(['en-US,en;q=0.9', 'fr-FR,fr;q=0.8,en;q=0.6', 'ar-DZ,ar;q=0.9,fr;q=0.8'])
+        # إضافة Accept عادي
+        if 'Accept' not in headers:
+            headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+        # إضافة Connection: keep-alive عادة
+        if 'Connection' not in headers:
+            headers['Connection'] = 'keep-alive'
+        return headers
+    # =========================================================
 
     async def analyze(self, target_url: str,
                       categories: Optional[List[str]] = None,
@@ -270,13 +297,10 @@ class WAFAnalyzer:
         print(f"  [WAF] Target : {target_url}")
         print(f"  [WAF] Param  : ?{test_param}=<payload>")
 
-        # Step 1: Baseline — get normal response fingerprint
+        # Step 1: Baseline — get normal response fingerprint (with mimicry)
         baseline = await self._get_baseline(target_url)
         if baseline.status == 0:
             print(f"  [WAF] ERROR: Target unreachable — {baseline.error}")
-            # NEW: if baseline fails completely, mark as aggressive block
-            profile.aggressive_block = True
-            profile.block_reason = f"Target unreachable: {baseline.error}"
             return profile
 
         print(f"  [WAF] Baseline: HTTP {baseline.status} "
@@ -289,17 +313,13 @@ class WAFAnalyzer:
         else:
             print(f"  [WAF] No WAF detected in baseline — testing detection capability")
 
-        # Step 3: Run probes
+        # Step 3: Run probes (with mimicry)
         selected = {k: v for k, v in WAF_PROBES.items()
                     if not categories or any(c in k for c in categories)}
 
         total_probes  = sum(len(v) for v in selected.values())
         total_blocked = 0
         results: List[WAFProbeResult] = []
-
-        # NEW: track consecutive failures to detect aggressive blocking
-        consecutive_failures = 0
-        max_consecutive_failures = 5   # threshold to consider IP banned
 
         print(f"\n  [WAF] Running {total_probes} probes across "
               f"{len(selected)} categories...\n")
@@ -309,7 +329,8 @@ class WAFAnalyzer:
             cat_results: List[WAFProbeResult] = []
 
             for probe_def in probes:
-                await asyncio.sleep(self.delay)
+                # Random delay to mimic human behavior
+                await asyncio.sleep(self.delay * random.uniform(0.8, 1.5))
 
                 result = await self._run_probe(
                     target_url, probe_def, category,
@@ -318,12 +339,6 @@ class WAFAnalyzer:
                 cat_results.append(result)
                 results.append(result)
 
-                # NEW: count failures (status 0 means request completely failed)
-                if result.status_code == 0:
-                    consecutive_failures += 1
-                else:
-                    consecutive_failures = 0   # reset on success
-
                 if result.blocked:
                     cat_blocked += 1
                     total_blocked += 1
@@ -331,44 +346,37 @@ class WAFAnalyzer:
                 icon = "🛡️ BLOCKED" if result.blocked else "⚠️  PASSED"
                 print(f"    [{category}] {icon} — {probe_def['desc']}")
 
-                # NEW: if consecutive failures exceed threshold, assume IP banned
-                if consecutive_failures >= max_consecutive_failures:
-                    print(f"\n  [WAF] !!! Detected aggressive blocking: IP appears to be banned !!!")
-                    profile.aggressive_block = True
-                    profile.block_reason = f"IP banned after {consecutive_failures} consecutive failed requests"
-                    break
-
             # Category summary
-            if probes:
-                rate = cat_blocked / len(probes) * 100
-                if rate >= 80:
-                    profile.strong_categories.append(category)
-                elif rate < 50:
-                    profile.weak_categories.append(category)
-                    profile.blind_spots.append(
-                        f"{category}: only {rate:.0f}% detected"
-                    )
-                print(f"    → Category score: {cat_blocked}/{len(probes)} "
-                      f"({rate:.0f}%)\n")
-
-            if profile.aggressive_block:
-                break
+            rate = cat_blocked / len(probes) * 100 if probes else 0
+            if rate >= 80:
+                profile.strong_categories.append(category)
+            elif rate < 50:
+                profile.weak_categories.append(category)
+                profile.blind_spots.append(
+                    f"{category}: only {rate:.0f}% detected"
+                )
+            print(f"    → Category score: {cat_blocked}/{len(probes)} "
+                  f"({rate:.0f}%)\n")
 
         profile.probe_results    = results
-        if total_probes > 0:
-            profile.detection_rate   = (total_blocked / total_probes * 100)
-        else:
-            profile.detection_rate = 0.0
+        profile.detection_rate   = (total_blocked / total_probes * 100
+                                     if total_probes else 0)
 
         # Step 4: Behavioral analysis
         profile.response_behavior = self._analyze_response_behavior(results, baseline)
 
-        # Step 5: Generate recommendations (include aggressive block note)
+        # =============== NEW: HTTP Request Smuggling Test ===============
+        smuggling_result = await self._test_smuggling(target_url)
+        profile.smuggling_vulnerable = smuggling_result.get('vulnerable', False)
+        profile.smuggling_details = smuggling_result
+        if smuggling_result.get('vulnerable'):
+            print(f"  [WAF] ⚠️  HTTP Request Smuggling possible: {smuggling_result.get('details')}")
+        # ================================================================
+
+        # Step 5: Generate recommendations
         profile.recommendations = self._generate_recommendations(profile)
 
         print(f"  [WAF] Overall detection rate: {profile.detection_rate:.1f}%")
-        if profile.aggressive_block:
-            print(f"  [WAF] AGGRESSIVE BLOCK DETECTED: {profile.block_reason}")
         print(f"  [WAF] Strong categories : {profile.strong_categories}")
         print(f"  [WAF] Weak categories   : {profile.weak_categories}")
 
@@ -379,7 +387,9 @@ class WAFAnalyzer:
     async def _get_baseline(self, url: str) -> ResponseData:
         """Get a clean baseline response with a benign parameter."""
         test_url = f"{url}{'&' if '?' in url else '?'}q=hello+world"
-        return await self.engine.request(test_url)
+        # إضافة رؤوس عادية
+        headers = self._add_realistic_headers({})
+        return await self.engine.request(test_url, extra_headers=headers)
 
     async def _run_probe(self, base_url: str, probe_def: Dict,
                           category: str, param: str,
@@ -397,6 +407,9 @@ class WAFAnalyzer:
             if len(parts) == 2:
                 extra_headers = {parts[0].strip(): parts[1].strip()}
                 url = base_url
+
+        # Add realistic headers
+        extra_headers = self._add_realistic_headers(extra_headers)
 
         start = time.perf_counter()
         resp  = await self.engine.request(url, extra_headers=extra_headers)
@@ -524,22 +537,103 @@ class WAFAnalyzer:
             "total_blocked":          len(blocked),
         }
 
+    # =============== NEW: HTTP Request Smuggling Test ===============
+    async def _test_smuggling(self, target_url: str) -> Dict[str, Any]:
+        """
+        اختبار وجود ثغرة HTTP Request Smuggling باستخدام تقنيات TE.CL و CL.TE.
+        """
+        result = {
+            'vulnerable': False,
+            'details': '',
+            'tests': []
+        }
+        host = target_url.split('://')[-1].split('/')[0]
+        path = '/' + '/'.join(target_url.split('/')[3:]) if len(target_url.split('/')) > 3 else '/'
+
+        # Test 1: TE.CL (Transfer-Encoding: chunked + Content-Length)
+        headers_te_cl = {
+            'Host': host,
+            'Transfer-Encoding': 'chunked',
+            'Content-Length': '4',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        # Chunked body
+        body_te_cl = "1\r\nZ\r\n0\r\n\r\nGET /admin HTTP/1.1\r\nHost: localhost\r\n\r\n"
+
+        start = time.perf_counter()
+        resp = await self.engine.request_raw(host, 443 if target_url.startswith('https') else 80,
+                                              path, method='POST', headers=headers_te_cl,
+                                              data=body_te_cl, use_https=target_url.startswith('https'))
+        elapsed = time.perf_counter() - start
+
+        test1 = {
+            'name': 'TE.CL',
+            'status': resp.status if resp else 0,
+            'time': elapsed,
+            'possible': False
+        }
+        # If we get a 200 but with weird timing or different body, may be vulnerable
+        if resp and resp.status == 200:
+            test1['possible'] = True
+            result['details'] += 'TE.CL caused unusual response; '
+        result['tests'].append(test1)
+
+        # Test 2: CL.TE (Content-Length + Transfer-Encoding: chunked)
+        headers_cl_te = {
+            'Host': host,
+            'Content-Length': '13',
+            'Transfer-Encoding': 'chunked',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        body_cl_te = "5\r\nGET /\r\n0\r\n\r\n"
+
+        resp = await self.engine.request_raw(host, 443 if target_url.startswith('https') else 80,
+                                              path, method='POST', headers=headers_cl_te,
+                                              data=body_cl_te, use_https=target_url.startswith('https'))
+        test2 = {
+            'name': 'CL.TE',
+            'status': resp.status if resp else 0,
+            'time': time.perf_counter() - start,
+            'possible': False
+        }
+        if resp and resp.status == 200:
+            test2['possible'] = True
+            result['details'] += 'CL.TE caused unusual response; '
+
+        # Test 3: Duplicate headers
+        headers_dup = {
+            'Host': host,
+            'Content-Length': '5',
+            'Content-Length': '6',
+            'User-Agent': 'Mozilla/5.0'
+        }
+        resp = await self.engine.request_raw(host, 443 if target_url.startswith('https') else 80,
+                                              path, method='POST', headers=headers_dup,
+                                              data='A=5', use_https=target_url.startswith('https'))
+        test3 = {
+            'name': 'Duplicate CL',
+            'status': resp.status if resp else 0,
+            'time': time.perf_counter() - start,
+            'possible': (resp and resp.status != 400)
+        }
+        if test3['possible']:
+            result['details'] += 'Duplicate Content-Length accepted; '
+        result['tests'].append(test3)
+
+        # If any test possible, mark vulnerable
+        if test1['possible'] or test2['possible'] or test3['possible']:
+            result['vulnerable'] = True
+            if not result['details']:
+                result['details'] = 'Possible HTTP Request Smuggling detected.'
+
+        return result
+    # ================================================================
+
     # ─────────────────── Recommendations ──────────────────────────────
 
     def _generate_recommendations(self, profile: WAFProfile) -> List[Dict]:
         """Generate actionable hardening recommendations."""
         recs: List[Dict] = []
-
-        # NEW: aggressive blocking recommendation
-        if profile.aggressive_block:
-            recs.append({
-                "priority":  "CRITICAL",
-                "title":     "Aggressive Blocking Detected (IP Banned)",
-                "detail":    profile.block_reason,
-                "action":    "Your IP has been banned. This is a legitimate defense, but you must exclude your scanner IP from blocking during assessments. Consider using a dedicated scanning IP or whitelisting.",
-            })
-            # No further analysis if banned
-            return recs
 
         if not profile.waf_detected:
             recs.append({
@@ -581,6 +675,16 @@ class WAFAnalyzer:
                     "action":   f"Enable paranoia level 2+ in OWASP CRS for {attack_type}.",
                 })
 
+        # =============== NEW: Smuggling recommendations ===============
+        if profile.smuggling_vulnerable:
+            recs.append({
+                "priority": "CRITICAL",
+                "title":    "HTTP Request Smuggling Vulnerability",
+                "detail":   profile.smuggling_details.get('details', 'Possible request smuggling detected.'),
+                "action":   "Configure reverse proxy to normalize TE/CL headers. Reject conflicting headers. Use HTTP/2 if possible.",
+            })
+        # ================================================================
+
         # General best practices
         recs.append({
             "priority": "MEDIUM",
@@ -613,92 +717,409 @@ def generate_waf_html_report(profile: WAFProfile) -> str:
     Generate a professional interactive HTML report from WAFProfile.
     Includes charts, filterable findings table, and recommendations.
     """
-    # If aggressive blocking, produce a simplified report
-    if profile.aggressive_block:
-        return f"""<!DOCTYPE html>
-<html><head><title>WAF Analysis – Aggressive Blocking</title>
-<style>body{{background:#0a0e1a;color:#e2e8f0;font-family:sans-serif;padding:40px}}</style></head>
+    # Build category chart data
+    behavior      = profile.response_behavior
+    cat_rates     = behavior.get("category_detection_rates", {})
+    evasion_data  = behavior.get("evasion_analysis", {})
+
+    categories_js = json.dumps(list(cat_rates.keys()))
+    rates_js      = json.dumps(list(cat_rates.values()))
+
+    # Build probe table rows
+    probe_rows = ""
+    for r in profile.probe_results:
+        status_class = "blocked" if r.blocked else "passed"
+        icon         = "🛡️" if r.blocked else "⚠️"
+        probe_rows  += f"""
+        <tr class="{status_class}">
+          <td><span class="badge badge-{status_class}">{icon} {'BLOCKED' if r.blocked else 'BYPASSED'}</span></td>
+          <td>{r.category}</td>
+          <td>{r.technique}</td>
+          <td><code class="payload">{_html_escape(r.payload[:60])}{'…' if len(r.payload)>60 else ''}</code></td>
+          <td>{r.status_code}</td>
+          <td>{r.response_time*1000:.0f}ms</td>
+          <td>{r.waf_signature or '—'}</td>
+        </tr>"""
+
+    # Build recommendations
+    rec_html = ""
+    for rec in profile.recommendations:
+        prio_class = rec["priority"].lower()
+        rec_html  += f"""
+        <div class="rec-card rec-{prio_class}">
+          <div class="rec-header">
+            <span class="rec-badge {prio_class}">{rec['priority']}</span>
+            <strong>{rec['title']}</strong>
+          </div>
+          <p class="rec-detail">{rec['detail']}</p>
+          <div class="rec-action"><span class="action-label">▶ Action</span> {rec['action']}</div>
+        </div>"""
+
+    # Evasion comparison table
+    evasion_html = ""
+    for attack, data in evasion_data.items():
+        concern_badge = '<span class="badge badge-passed" style="background:#e74c3c">⚠️ CONCERN</span>' if data.get("concern") else '<span class="badge badge-blocked">✓ OK</span>'
+        evasion_html += f"""
+        <tr>
+          <td><strong>{attack}</strong></td>
+          <td>{data['basic_detection_rate']}%</td>
+          <td>{data['evasion_detection_rate']}%</td>
+          <td>{data['evasion_effectiveness']}</td>
+          <td>{concern_badge}</td>
+        </tr>"""
+
+    overall_color = ("#27ae60" if profile.detection_rate >= 80
+                     else "#f39c12" if profile.detection_rate >= 50
+                     else "#e74c3c")
+    overall_grade = ("A" if profile.detection_rate >= 90
+                     else "B" if profile.detection_rate >= 75
+                     else "C" if profile.detection_rate >= 60
+                     else "D" if profile.detection_rate >= 40
+                     else "F")
+
+    # Add smuggling warning in report
+    smuggling_warning = ''
+    if profile.smuggling_vulnerable:
+        smuggling_warning = f"""
+        <div class="card" style="border-color:#e74c3c">
+          <div class="card-title" style="color:#e74c3c">⚠️ HTTP Request Smuggling Risk</div>
+          <p><strong>Vulnerable:</strong> {profile.smuggling_details.get('details', 'Yes')}</p>
+        </div>
+        """
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WAF Analysis Report — {profile.target}</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap');
+
+  :root {{
+    --bg:        #0a0e1a;
+    --surface:   #111827;
+    --surface2:  #1a2236;
+    --border:    #1e3a5f;
+    --accent:    #00d4ff;
+    --accent2:   #7c3aed;
+    --text:      #e2e8f0;
+    --muted:     #64748b;
+    --green:     #10b981;
+    --yellow:    #f59e0b;
+    --red:       #ef4444;
+    --mono:      'JetBrains Mono', monospace;
+    --sans:      'Syne', sans-serif;
+  }}
+
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+  body {{
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.6;
+  }}
+
+  /* ── Header ── */
+  .header {{
+    background: linear-gradient(135deg, #0a0e1a 0%, #0d1b3e 50%, #0a0e1a 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 40px 60px;
+    position: relative;
+    overflow: hidden;
+  }}
+  .header::before {{
+    content: '';
+    position: absolute; inset: 0;
+    background: repeating-linear-gradient(
+      90deg, transparent, transparent 80px,
+      rgba(0,212,255,.03) 80px, rgba(0,212,255,.03) 81px
+    );
+  }}
+  .header-top {{ display: flex; justify-content: space-between; align-items: flex-start; }}
+  .logo {{ font-size: 11px; font-family: var(--mono); color: var(--accent); letter-spacing: 3px; text-transform: uppercase; }}
+  .report-title {{ font-size: 32px; font-weight: 800; margin: 16px 0 4px; letter-spacing: -1px; }}
+  .report-title span {{ color: var(--accent); }}
+  .report-meta {{ font-family: var(--mono); font-size: 12px; color: var(--muted); }}
+  .grade-box {{
+    text-align: center;
+    background: rgba(0,0,0,.4);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px 30px;
+  }}
+  .grade-letter {{ font-size: 64px; font-weight: 800; color: {overall_color}; line-height: 1; }}
+  .grade-label {{ font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 4px; }}
+
+  /* ── Layout ── */
+  .container {{ max-width: 1400px; margin: 0 auto; padding: 40px 60px; }}
+  .grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 24px; }}
+  .grid-3 {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 24px; margin-bottom: 24px; }}
+  @media (max-width: 900px) {{ .grid-2, .grid-3 {{ grid-template-columns: 1fr; }} }}
+
+  /* ── Cards ── */
+  .card {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+  }}
+  .card-title {{
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 16px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+  }}
+
+  /* ── Stat boxes ── */
+  .stat-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }}
+  .stat {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+  }}
+  .stat::before {{
+    content: '';
+    position: absolute; top: 0; left: 0; right: 0; height: 2px;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+  }}
+  .stat-value {{ font-size: 36px; font-weight: 800; font-family: var(--mono); color: var(--accent); }}
+  .stat-label {{ font-size: 11px; color: var(--muted); margin-top: 4px; text-transform: uppercase; letter-spacing: 1px; }}
+
+  /* ── Table ── */
+  .table-wrap {{ overflow-x: auto; }}
+  table {{ width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }}
+  th {{
+    background: var(--surface2);
+    color: var(--muted);
+    font-size: 10px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }}
+  td {{ padding: 10px 14px; border-bottom: 1px solid rgba(30,58,95,.3); vertical-align: middle; }}
+  tr:hover td {{ background: rgba(0,212,255,.03); }}
+  tr.passed td {{ opacity: .75; }}
+
+  .badge {{
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .5px;
+  }}
+  .badge-blocked {{ background: rgba(16,185,129,.15); color: var(--green); border: 1px solid rgba(16,185,129,.3); }}
+  .badge-passed  {{ background: rgba(239,68,68,.15);  color: var(--red);   border: 1px solid rgba(239,68,68,.3); }}
+
+  code.payload {{
+    background: rgba(0,0,0,.4);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 11px;
+    color: #fbbf24;
+    word-break: break-all;
+  }}
+
+  /* ── Filter bar ── */
+  .filter-bar {{
+    display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap;
+  }}
+  .filter-btn {{
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    padding: 6px 16px;
+    border-radius: 20px;
+    cursor: pointer;
+    font-family: var(--mono);
+    font-size: 11px;
+    transition: all .2s;
+  }}
+  .filter-btn:hover, .filter-btn.active {{
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #000;
+  }}
+
+  /* ── Recommendations ── */
+  .rec-card {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+    margin-bottom: 12px;
+    border-left: 4px solid var(--border);
+  }}
+  .rec-card.rec-critical {{ border-left-color: var(--red); }}
+  .rec-card.rec-high     {{ border-left-color: var(--yellow); }}
+  .rec-card.rec-medium   {{ border-left-color: var(--accent); }}
+  .rec-card.rec-low      {{ border-left-color: var(--green); }}
+  .rec-header {{ display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }}
+  .rec-badge {{
+    display: inline-block; padding: 2px 10px; border-radius: 4px;
+    font-size: 10px; font-weight: 700; font-family: var(--mono);
+  }}
+  .rec-badge.critical {{ background: rgba(239,68,68,.2);  color: var(--red); }}
+  .rec-badge.high     {{ background: rgba(245,158,11,.2); color: var(--yellow); }}
+  .rec-badge.medium   {{ background: rgba(0,212,255,.1);  color: var(--accent); }}
+  .rec-badge.low      {{ background: rgba(16,185,129,.1); color: var(--green); }}
+  .rec-detail {{ color: var(--muted); font-size: 13px; margin-bottom: 10px; }}
+  .rec-action {{ font-family: var(--mono); font-size: 12px; background: rgba(0,0,0,.3); padding: 10px 14px; border-radius: 6px; border-left: 2px solid var(--accent); }}
+  .action-label {{ color: var(--accent); font-weight: 700; margin-right: 8px; }}
+
+  /* ── Donut ── */
+  .donut-wrap {{ position: relative; width: 160px; height: 160px; margin: 0 auto 16px; }}
+  .donut-center {{
+    position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    text-align: center;
+  }}
+  .donut-pct {{ font-size: 26px; font-weight: 800; color: var(--accent); font-family: var(--mono); }}
+  .donut-sub {{ font-size: 10px; color: var(--muted); }}
+
+  /* ── Section headers ── */
+  .section-title {{
+    font-size: 20px; font-weight: 800; margin: 40px 0 20px;
+    display: flex; align-items: center; gap: 12px;
+  }}
+  .section-title::after {{
+    content: ''; flex: 1; height: 1px;
+    background: linear-gradient(90deg, var(--border), transparent);
+  }}
+
+  /* ── Footer ── */
+  footer {{
+    text-align: center;
+    padding: 30px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    border-top: 1px solid var(--border);
+    margin-top: 60px;
+  }}
+</style>
+</head>
 <body>
-<h1 style="color:#ef4444">⛔ Aggressive Blocking Detected</h1>
-<p><strong>Target:</strong> {profile.target}</p>
-<p><strong>Reason:</strong> {profile.block_reason}</p>
-<p>Your scanner IP has been banned. The WAF is working correctly by blocking your requests entirely.<br>
-To continue testing, you must whitelist your scanner IP or use a dedicated assessment IP.</p>
-<p><em>Generated: {profile.timestamp}</em></p>
-</body></html>"""
 
-    # Otherwise, full report (same as original, omitted here for brevity – but kept intact)
-    # (the original generate_waf_html_report remains unchanged)
-    # For brevity in this answer, I'll include a placeholder; in actual delivery I would include the full code.
-    return "Full HTML report (original unchanged)"
+<!-- ── Header ─────────────────────────────────────────────── -->
+<div class="header">
+  <div class="header-top">
+    <div>
+      <div class="logo">RECON-DZ v3 · Defensive WAF Analysis</div>
+      <h1 class="report-title">WAF <span>Behavior</span> Report</h1>
+      <p class="report-meta">
+        Target: {profile.target} &nbsp;|&nbsp;
+        WAF: {profile.waf_detected or 'Not detected'} &nbsp;|&nbsp;
+        Generated: {profile.timestamp}
+      </p>
+    </div>
+    <div class="grade-box">
+      <div class="grade-letter">{overall_grade}</div>
+      <div class="grade-label">WAF Grade</div>
+    </div>
+  </div>
+</div>
 
+<div class="container">
 
-# ─────────────────────────────────────────────────────────────────────
-#  Helpers
-# ─────────────────────────────────────────────────────────────────────
+<!-- ── Stats ─────────────────────────────────────────────── -->
+<div class="stat-grid">
+  <div class="stat">
+    <div class="stat-value">{profile.detection_rate:.0f}%</div>
+    <div class="stat-label">Detection Rate</div>
+  </div>
+  <div class="stat">
+    <div class="stat-value">{behavior.get('total_blocked', 0)}</div>
+    <div class="stat-label">Attacks Blocked</div>
+  </div>
+  <div class="stat">
+    <div class="stat-value">{behavior.get('total_probes', 0) - behavior.get('total_blocked', 0)}</div>
+    <div class="stat-label">Attacks Bypassed</div>
+  </div>
+  <div class="stat">
+    <div class="stat-value">{len(profile.blind_spots)}</div>
+    <div class="stat-label">Blind Spots Found</div>
+  </div>
+</div>
 
-def _html_escape(s: str) -> str:
-    return (s.replace("&", "&amp;").replace("<", "&lt;")
-             .replace(">", "&gt;").replace('"', "&quot;"))
+{smuggling_warning}
 
+<!-- ── Charts row ─────────────────────────────────────────── -->
+<div class="grid-2">
+  <div class="card">
+    <div class="card-title">Detection Rate by Attack Category</div>
+    <canvas id="barChart" height="220"></canvas>
+  </div>
+  <div class="card">
+    <div class="card-title">Overall WAF Coverage</div>
+    <div class="donut-wrap">
+      <canvas id="donutChart"></canvas>
+      <div class="donut-center">
+        <div class="donut-pct">{profile.detection_rate:.0f}%</div>
+        <div class="donut-sub">blocked</div>
+      </div>
+    </div>
+    <div style="margin-top:16px">
+      <p style="font-size:12px;color:var(--muted);margin-bottom:8px">Category Summary</p>
+      {"".join(f'<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid rgba(30,58,95,.3);font-family:var(--mono);font-size:12px"><span>{cat}</span><span style="color:{"var(--green)" if r>=80 else "var(--yellow)" if r>=50 else "var(--red)"}">{r:.0f}%</span></div>' for cat, r in cat_rates.items())}
+    </div>
+  </div>
+</div>
 
-def _get_category_fix(category: str) -> str:
-    fixes = {
-        "SQLi":          "Enable SQLi rules in OWASP CRS. Use parameterized queries in code.",
-        "XSS":           "Enable XSS rules in OWASP CRS. Implement Content-Security-Policy.",
-        "PathTraversal": "Enable path traversal rules. Restrict file access in server config.",
-        "CMDi":          "Enable command injection rules. Never pass user input to shell.",
-        "SSRF":          "Block private IP ranges in egress firewall. Validate all URLs.",
-        "HeaderInjection":"Validate and sanitize all HTTP headers. Strip untrusted headers.",
-        "PayloadSize":   "Set max request size limit (e.g. 1MB). Enable slow request protection.",
-        "EncodingTricks":"Enable URL decoding normalization before rule matching.",
-    }
-    for k, v in fixes.items():
-        if k.lower() in category.lower():
-            return v
-    return "Review WAF ruleset for this attack category."
+<!-- ── Evasion Analysis ───────────────────────────────────── -->
+{'<h2 class="section-title">Evasion Technique Analysis</h2><div class="card"><div class="card-title">Basic vs Evasion Detection Rate</div><div class="table-wrap"><table><thead><tr><th>Attack Type</th><th>Basic Detection</th><th>Evasion Detection</th><th>Drop</th><th>Status</th></tr></thead><tbody>' + evasion_html + '</tbody></table></div></div>' if evasion_html else ''}
 
+<!-- ── Probe Results Table ────────────────────────────────── -->
+<h2 class="section-title">Detailed Probe Results</h2>
+<div class="card">
+  <div class="card-title">All Probes</div>
+  <div class="filter-bar" id="filterBar">
+    <button class="filter-btn active" onclick="filterTable('all')">All</button>
+    <button class="filter-btn" onclick="filterTable('blocked')">🛡️ Blocked</button>
+    <button class="filter-btn" onclick="filterTable('passed')">⚠️ Bypassed</button>
+    {"".join(f'<button class="filter-btn" onclick="filterCat(\'{c}\')">{c}</button>' for c in cat_rates.keys())}
+  </div>
+  <div class="table-wrap">
+    <table id="probeTable">
+      <thead>
+        <tr>
+          <th>Status</th><th>Category</th><th>Technique</th>
+          <th>Payload</th><th>HTTP</th><th>Time</th><th>WAF Rule</th>
+        </tr>
+      </thead>
+      <tbody>{probe_rows}</tbody>
+    </table>
+  </div>
+</div>
 
-def save_waf_report(profile: WAFProfile, output_dir: str = "./results") -> Dict[str, str]:
-    """Save JSON + HTML reports and return file paths."""
-    from pathlib import Path
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+<!-- ── Recommendations ───────────────────────────────────── -->
+<h2 class="section-title">Hardening Recommendations</h2>
+{rec_html}
 
-    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe = re.sub(r'[^\w]', '_', profile.target)[:40]
-    stem = f"{ts}_waf_{safe}"
+</div><!-- /container -->
 
-    # JSON
-    json_path = out / f"{stem}.json"
-    data = {
-        "target":            profile.target,
-        "waf_detected":      profile.waf_detected,
-        "detection_rate":    profile.detection_rate,
-        "grade":             ("A" if profile.detection_rate >= 90 else
-                              "B" if profile.detection_rate >= 75 else
-                              "C" if profile.detection_rate >= 60 else
-                              "D" if profile.detection_rate >= 40 else "F"),
-        "blind_spots":       profile.blind_spots,
-        "strong_categories": profile.strong_categories,
-        "weak_categories":   profile.weak_categories,
-        "response_behavior": profile.response_behavior,
-        "recommendations":   profile.recommendations,
-        "probes":            [
-            {"category": r.category, "technique": r.technique,
-             "payload": r.payload, "blocked": r.blocked,
-             "status": r.status_code, "time_ms": round(r.response_time*1000, 1)}
-            for r in profile.probe_results
-        ],
-        "timestamp": profile.timestamp,
-        # NEW fields
-        "aggressive_block":   profile.aggressive_block,
-        "block_reason":       profile.block_reason,
-    }
-    json_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+<footer>
+  RECON-DZ v3 · WAF Defensive Analysis · Authorized Use Only<br>
+  {profile.timestamp}
+</footer>
 
-    # HTML
-    html_path = out / f"{stem}.html"
-    html_path.write_text(generate_waf_html_report(profile), encoding="utf-8")
-
-    return {"json": str(json_path), "html": str(html_path)}
+<script>
+// ── Bar Chart ──────────────────────────────────────────────
+const categories = {categories_js};
+const rates      = {rates_js};
+const colors     = rates.map(r => r >= 80 ? '#
