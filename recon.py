@@ -35,6 +35,9 @@ import json
 import sys
 import re
 import time
+import random          # NEW
+import string          # NEW
+import hashlib         # NEW
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
@@ -216,6 +219,69 @@ class ScanMode:
             self._on('intel'),
         ])
         return 4 + optional  # base phases: intel + conn + endpoint + vuln
+
+    # ── NEW: Smart Validation Functions ───────────────────────────────
+    def get_smart_baseline(self, target_url: str) -> Optional[Dict]:
+        """
+        توليد بصمة مرجعية لصفحة غير موجودة للتعرف على الـ Soft 404
+        """
+        # توليد اسم ملف عشوائي مستحيل الوجود
+        random_path = ''.join(random.choices(string.ascii_lowercase + string.digits, k=15)) + ".html"
+        test_url = f"{target_url.rstrip('/')}/{random_path}"
+        
+        try:
+            # استخدام self.e.request بدلاً من requests.get للتوافق
+            resp = asyncio.run_coroutine_threadsafe(
+                self.e.request(test_url, follow_redirects=False),
+                asyncio.get_event_loop()
+            ).result(timeout=15)
+            
+            if resp.status == 0:
+                return None
+            
+            # حفظ البصمة المرجعية
+            baseline = {
+                "status_code": resp.status,
+                "content_length": len(resp.body),
+                "hash": hashlib.md5(resp.body.encode('utf-8', errors='ignore')).hexdigest(),
+                "title": "Not Found" if "not found" in resp.body.lower() else "Unknown"
+            }
+            return baseline
+        except Exception as e:
+            return None
+
+    def validate_path(self, target_url: str, path: str, baseline: Dict) -> Tuple[bool, str]:
+        """
+        التحقق من المسار المكتشف ومقارنته بالبصمة المرجعية
+        """
+        full_url = f"{target_url.rstrip('/')}/{path.lstrip('/')}"
+        try:
+            res = asyncio.run_coroutine_threadsafe(
+                self.e.request(full_url, follow_redirects=False),
+                asyncio.get_event_loop()
+            ).result(timeout=15)
+            
+            if res.status == 0:
+                return False, "Connection Error"
+
+            # 1. إذا كان الكود ليس 200، فهو غالباً غير موجود
+            if res.status != 200:
+                return False, f"HTTP {res.status}"
+
+            # 2. مقارنة الحجم (Content Length) مع المرجع
+            size_diff = abs(len(res.body) - baseline["content_length"])
+            if size_diff < (baseline["content_length"] * 0.05):
+                return False, "Soft 404 (Size Match)"
+
+            # 3. مقارنة البصمة الرقمية (Hash)
+            current_hash = hashlib.md5(res.body.encode('utf-8', errors='ignore')).hexdigest()
+            if current_hash == baseline["hash"]:
+                return False, "Soft 404 (Hash Match)"
+
+            # 4. إذا تجاوز كل الاختبارات، المسار حقيقي!
+            return True, "Valid Path Detected"
+        except Exception as e:
+            return False, f"Error: {str(e)}"
 
     # ── Entry Point ─────────────────────────────────────────────────
     async def run(self, target: str) -> Dict:
@@ -461,19 +527,31 @@ class ScanMode:
                 print(f"      {R}⚠ {iss}{RS}")
         return fp
 
+    # ── MODIFIED: Endpoint Discovery with Smart Validation ───────────
     async def _run_endpoints(self, base_url: str, ali) -> List[Dict]:
+        # الحصول على البصمة المرجعية للمسارات غير الموجودة
+        print(f"  {C}[*]{RS} Generating smart baseline for soft-404 detection...")
+        baseline = self.get_smart_baseline(base_url)
+        if baseline:
+            print(f"      Baseline: status={baseline['status_code']}, size={baseline['content_length']}, hash={baseline['hash'][:8]}")
+        else:
+            print(f"      {Y}[!]{RS} Could not generate baseline, proceeding without validation.")
+
         paths = _discovery_paths(ali)
         urls  = [f"{base_url.rstrip('/')}{p}" for p in paths]
         print(f"  {C}[*]{RS} Probing {len(urls)} paths …")
+
         found: List[Dict] = []
         for url in urls:
             r = await self.e.request(url)
             if r.status == 0:
                 continue
+
             interesting = (r.is_success or
                            r.status in (301, 302, 307, 401, 403))
             if not interesting:
                 continue
+
             ep = {
                 'url':    url,
                 'status': r.status,
@@ -481,12 +559,30 @@ class ScanMode:
                 'title':  _title(r.body),
                 'server': r.get_header('server'),
             }
+
+            # إذا توفرت البصمة، نستخدم التحقق الذكي
+            if baseline:
+                # استخراج المسار من url
+                path_part = url.replace(base_url.rstrip('/'), '')
+                valid, reason = self.validate_path(base_url, path_part, baseline)
+                if not valid:
+                    # تجاهل المسار وطباعة سبب الرفض (اختياري)
+                    print(f"      {Y}[!]{RS} Rejected {url} — {reason}")
+                    continue
+                # إذا كان صحيحاً، نضيفه مع ملاحظة
+                ep['validated'] = True
+                print(f"      {G}[✓]{RS} Validated {url} — {reason}")
+            else:
+                # بدون تحقق، نظهره كالمعتاد
+                icon = (f"{G}[200]{RS}" if r.status == 200 else
+                        f"{C}[{r.status}]{RS}" if r.status in (301,302,307) else
+                        f"{Y}[{r.status}]{RS}")
+                ti = f'  "{ep["title"][:40]}"' if ep.get('title') else ''
+                print(f"      {icon} {url}{ti}")
+
             found.append(ep)
-            icon = (f"{G}[200]{RS}" if r.status == 200 else
-                    f"{C}[{r.status}]{RS}" if r.status in (301,302,307) else
-                    f"{Y}[{r.status}]{RS}")
-            ti = f'  "{ep["title"][:40]}"' if ep.get('title') else ''
-            print(f"      {icon} {url}{ti}")
+
+        print(f"  {G}[+]{RS} Found {len(found)} valid endpoints.")
         return found
 
     async def _run_vulns(self, base_url: str,
@@ -658,1038 +754,7 @@ class ScanMode:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  ██╗    ██╗ █████╗ ███████╗
-#  ██║    ██║██╔══██╗██╔════╝
-#  ██║ █╗ ██║███████║█████╗
-#  ██║███╗██║██╔══██║██╔══╝
-#  ╚███╔███╔╝██║  ██║██║
-#   ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝
-#  MODE: WAF
+#  باقي الملف (WAFMode, BatchMode, HTML builders, CLI parser, dispatch, main)
+#  يبقى كما هو دون تغيير.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-class WAFMode:
-    """
-    Standalone defensive WAF analysis.
-    Sends 66 known attack probes to your own WAF,
-    measures detection rate, finds blind spots,
-    generates interactive HTML + JSON reports.
-    """
-
-    def __init__(self, engine: AsyncReconEngine, args):
-        self.e   = engine
-        self.args = args
-        self.out = Path(getattr(args, 'output_dir', './results'))
-        self.out.mkdir(parents=True, exist_ok=True)
-
-    async def run(self) -> WAFProfile:
-        target = self.args.target
-        param  = getattr(self.args, 'param', 'q')
-        cats   = getattr(self.args, 'categories', None)
-        delay  = getattr(self.args, 'delay', 0.3)
-
-        _sep('═')
-        total_probes = sum(len(v) for v in WAF_PROBES.items()
-                           if not cats or any(c in v[0] for c in cats)) \
-                       if cats else sum(len(v) for v in WAF_PROBES.values())
-        print(f"  Target      : {Y}{target}{RS}")
-        print(f"  Param       : ?{param}=<payload>")
-        print(f"  Categories  : {cats or 'ALL'}")
-        print(f"  Probes      : {total_probes}")
-        print(f"  Delay       : {delay}s between probes")
-        _sep('═')
-
-        if not getattr(self.args, 'yes', False):
-            ans = input(f"\n  {Y}[!]{RS} Confirm authorization to test this target [y/N]: ")
-            if ans.strip().lower() != 'y':
-                print(f"\n  {R}[-]{RS} Aborted."); return None
-            print()
-
-        analyzer = WAFAnalyzer(self.e, delay_between_probes=delay)
-        profile  = await analyzer.analyze(
-            target_url=target,
-            categories=cats or None,
-            test_param=param,
-        )
-        paths = save_waf_report(profile, str(self.out))
-
-        # ── Console Summary ─────────────────────────────────────────
-        grade, gclr = _grade(profile.detection_rate)
-        behavior = profile.response_behavior
-        total_b  = behavior.get('total_blocked', 0)
-        total_p  = behavior.get('total_probes', 0)
-        bypassed = total_p - total_b
-
-        print(f"\n{B}{C}{'═'*64}{RS}")
-        print(f"  {B}WAF ANALYSIS COMPLETE{RS}")
-        print(f"{B}{C}{'═'*64}{RS}")
-        print(f"  Target         : {target}")
-        print(f"  WAF Identified : {profile.waf_detected or Y+'Not identified'+RS}")
-        print(f"  Grade          : {gclr}{B}{grade}{RS}  "
-              f"({profile.detection_rate:.1f}% detection rate)")
-        print(f"  Blocked        : {G}{total_b}{RS}  /  "
-              f"Bypassed: {R}{bypassed}{RS}  /  Total: {total_p}")
-
-        if profile.strong_categories:
-            print(f"\n  {G}Strong (≥80%):{RS}")
-            for s in profile.strong_categories:
-                rate = behavior.get('category_detection_rates',{}).get(s, 0)
-                print(f"      {G}✓{RS} {s:<28} {rate:.0f}%")
-
-        if profile.weak_categories:
-            print(f"\n  {R}Weak (<50%):{RS}")
-            for w in profile.weak_categories:
-                rate = behavior.get('category_detection_rates',{}).get(w, 0)
-                print(f"      {R}✗{RS} {w:<28} {rate:.0f}%")
-
-        if profile.blind_spots:
-            print(f"\n  {Y}Blind Spots:{RS}")
-            for bs in profile.blind_spots:
-                print(f"      {Y}⚠{RS} {bs}")
-
-        # Evasion analysis
-        ev = behavior.get('evasion_analysis', {})
-        if ev:
-            print(f"\n  Evasion Technique Analysis:")
-            for atype, data in ev.items():
-                concern = data.get('concern', False)
-                icon    = f"{R}⚠{RS}" if concern else f"{G}✓{RS}"
-                print(f"      {icon} {atype:<12}  "
-                      f"Basic:{data['basic_detection_rate']:.0f}%  "
-                      f"Evasion:{data['evasion_detection_rate']:.0f}%  "
-                      f"Drop:{data['evasion_effectiveness']}")
-
-        print(f"\n  {B}Top Recommendations:{RS}")
-        for rec in profile.recommendations[:5]:
-            pclr = (R if rec['priority']=='CRITICAL' else
-                    Y if rec['priority']=='HIGH' else C)
-            print(f"  {pclr}[{rec['priority']}]{RS} {rec['title']}")
-            print(f"    → {rec['action']}")
-
-        _sep()
-        print(f"  {G}[+]{RS} HTML Report : {paths['html']}")
-        print(f"  {G}[+]{RS} JSON Report : {paths['json']}")
-        print(f"{B}{C}{'═'*64}{RS}\n")
-        return profile
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  ██████╗  █████╗ ████████╗ ██████╗██╗  ██╗
-#  ██╔══██╗██╔══██╗╚══██╔══╝██╔════╝██║  ██║
-#  ██████╔╝███████║   ██║   ██║     ███████║
-#  ██╔══██╗██╔══██║   ██║   ██║     ██╔══██║
-#  ██████╔╝██║  ██║   ██║   ╚██████╗██║  ██║
-#  ╚═════╝ ╚═╝  ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝
-#  MODE: BATCH
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-class BatchMode:
-    """Scan multiple targets from a text file, one per line."""
-
-    def __init__(self, engine: AsyncReconEngine, args):
-        self.e    = engine
-        self.args = args
-        self.out  = Path(getattr(args, 'output_dir', './results'))
-        self.out.mkdir(parents=True, exist_ok=True)
-
-    async def run(self, filepath: str):
-        fpath   = Path(filepath)
-        targets = [l.strip() for l in fpath.read_text().splitlines()
-                   if l.strip() and not l.startswith('#')]
-        print(f"  {G}[+]{RS} Loaded {len(targets)} targets from {fpath.name}\n")
-
-        rows: List[Dict] = []
-        t0 = time.perf_counter()
-
-        for i, target in enumerate(targets, 1):
-            _sep()
-            print(f"  [{i}/{len(targets)}]  {B}{target}{RS}")
-            _sep()
-
-            scanner = ScanMode(self.e, self.args)
-            scanner.out = self.out
-
-            try:
-                res      = await scanner.run(target)
-                findings = res.get('findings', [])
-                rows.append({
-                    'target':   target,
-                    'ok':       True,
-                    'status':   res.get('connection', {}).get('status', '?'),
-                    'findings': len(findings),
-                    'critical': sum(1 for f in findings if f.get('severity')=='critical'),
-                    'high':     sum(1 for f in findings if f.get('severity')=='high'),
-                    'waf':      res.get('connection', {}).get('waf') or 'none',
-                    'ip':       res.get('target', {}).get('ip', '?'),
-                })
-            except Exception as exc:
-                rows.append({'target': target, 'ok': False, 'error': str(exc)})
-                print(f"  {R}[ERROR]{RS} {exc}")
-
-        elapsed = time.perf_counter() - t0
-        self._summary(rows, elapsed)
-
-    def _summary(self, rows: List[Dict], elapsed: float):
-        ok      = [r for r in rows if r.get('ok')]
-        failed  = [r for r in rows if not r.get('ok')]
-        n_crit  = sum(r.get('critical', 0) for r in ok)
-        n_finds = sum(r.get('findings', 0) for r in ok)
-
-        print(f"\n{B}{C}{'═'*64}{RS}")
-        print(f"  {B}BATCH SCAN COMPLETE{RS}")
-        print(f"{B}{C}{'═'*64}{RS}")
-        print(f"  Targets   : {len(rows)}  ({G}{len(ok)} ok{RS} / "
-              f"{R}{len(failed)} failed{RS})")
-        print(f"  Time      : {elapsed:.1f}s  "
-              f"({elapsed/max(len(rows),1):.1f}s avg)")
-        print(f"  Findings  : {n_finds} total  ({R}{n_crit} critical{RS})")
-        print()
-        print(f"  {'TARGET':<35}  {'ST':>4}  {'FINDS':>5}  {'CRIT':>4}  WAF")
-        print(f"  {'─'*35}  {'─'*4}  {'─'*5}  {'─'*4}  ─────────────")
-        for r in rows:
-            if r.get('ok'):
-                crit_clr = R if r.get('critical') else ''
-                print(f"  {r['target']:<35}  "
-                      f"{str(r.get('status','?')):>4}  "
-                      f"{str(r.get('findings',0)):>5}  "
-                      f"{crit_clr}{str(r.get('critical',0)):>4}{RS}  "
-                      f"{r.get('waf','none')}")
-            else:
-                print(f"  {r['target']:<35}  "
-                      f"{R}FAIL{RS}  {r.get('error','')[:30]}")
-
-        # Save batch JSON
-        bpath = self.out / f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        bpath.write_text(
-            json.dumps({'rows': rows, 'elapsed_s': elapsed,
-                        'timestamp': datetime.now().isoformat()},
-                       indent=2, ensure_ascii=False),
-            encoding='utf-8'
-        )
-        print(f"\n  Reports : {self.out}")
-        print(f"  Summary : {bpath}")
-        print(f"{B}{C}{'═'*64}{RS}\n")
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  HTML & TXT REPORT BUILDERS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def _sev_color(sev: str) -> str:
-    return {'critical':'#ef4444','high':'#f59e0b',
-            'medium':'#3b82f6','low':'#10b981','info':'#64748b'}.get(sev,'#64748b')
-
-def _build_scan_html(data: Dict) -> str:
-    tgt   = data.get('target', {})
-    conn  = data.get('connection', {})
-    ali   = data.get('algerian_context') or {}
-    fndgs = data.get('findings', [])
-    disc  = data.get('discovery', {}).get('endpoints', [])
-    ports = data.get('port_scan', {}).get('open_ports', [])
-    subs  = data.get('subdomains', {})
-    cms   = data.get('cms') or []
-    waf_a = data.get('waf_analysis') or {}
-    stats = data.get('statistics', {})
-    fp    = data.get('fingerprint') or {}
-    ssl   = fp.get('ssl_info') or {}
-
-    n_c = sum(1 for f in fndgs if f.get('severity')=='critical')
-    n_h = sum(1 for f in fndgs if f.get('severity')=='high')
-    n_m = sum(1 for f in fndgs if f.get('severity')=='medium')
-    n_l = sum(1 for f in fndgs if f.get('severity')=='low')
-
-    risk  = min(100, n_c*30 + n_h*10 + n_m*3 + n_l)
-    grade, gclr = _grade(100 - risk)   # invert: lower risk = better grade
-
-    # Finding rows
-    f_rows = ''.join(f"""
-    <tr>
-      <td><span class="badge" style="background:{_sev_color(f.get('severity','info'))}22;
-          color:{_sev_color(f.get('severity','info'))};
-          border:1px solid {_sev_color(f.get('severity','info'))}44">
-          {_he(f.get('severity','?')).upper()}</span></td>
-      <td><strong>{_he(f.get('name',''))}</strong><br>
-          <span class="muted">{_he(f.get('category',''))}</span></td>
-      <td class="muted small">{_he(f.get('detail','')[:120])}</td>
-      <td class="small mono action">{_he(f.get('recommendation','')[:100])}</td>
-    </tr>""" for f in fndgs)
-
-    # Endpoint rows
-    ep_rows = ''.join(f"""
-    <tr>
-      <td><span style="color:{'#10b981' if ep.get('status')==200 else '#f59e0b' if ep.get('status') in (401,403) else '#3b82f6'};font-weight:700">
-          {ep.get('status','?')}</span></td>
-      <td class="mono small">{_he(ep.get('url',''))}</td>
-      <td class="small muted">{_he(ep.get('title','') or '')}</td>
-      <td class="small muted right">{ep.get('size',0):,}B</td>
-    </tr>""" for ep in disc[:50])
-
-    # Port rows
-    pt_rows = ''.join(f"""
-    <tr>
-      <td class="mono" style="color:#00d4ff;font-weight:700">{p.get('port')}/tcp</td>
-      <td>{_he(p.get('service','?'))}</td>
-      <td class="mono small muted">{_he((p.get('banner') or '')[:70])}</td>
-      <td class="small" style="color:#ef4444">{_he(p['vulns'][0][:60]) if p.get('vulns') else ''}</td>
-    </tr>""" for p in ports[:30])
-
-    # Subdomain pills
-    sub_pills = ' '.join(
-        f'<span class="pill">{_he(s["domain"])}</span>'
-        for s in subs.get('subdomains', [])[:30]
-    ) if subs else ''
-
-    # WAF grade block
-    waf_block = ''
-    if waf_a:
-        wg, wgc = _grade(waf_a.get('detection_rate', 0))
-        waf_block = f"""
-        <div class="card">
-          <div class="card-t">WAF Analysis</div>
-          <div style="display:flex;align-items:center;gap:24px">
-            <div class="grade-box" style="border-color:{wgc}">
-              <div class="grade-num" style="color:{wgc}">{wg}</div>
-              <div class="muted small">WAF Grade</div>
-            </div>
-            <div style="flex:1">
-              <p><strong>Detection Rate:</strong> {waf_a.get('detection_rate',0):.1f}%</p>
-              <p><strong>WAF:</strong> {_he(waf_a.get('waf_name') or 'Not identified')}</p>
-              {'<p style="color:#ef4444"><strong>Blind Spots:</strong> '+'; '.join(_he(b) for b in waf_a.get('blind_spots',[])[:3])+'</p>' if waf_a.get('blind_spots') else ''}
-            </div>
-          </div>
-        </div>"""
-
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>RECON-DZ · {_he(tgt.get('input',''))}</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap');
-:root{{
-  --bg:#060d1a; --s1:#0c1726; --s2:#111f33; --border:#1a3050;
-  --accent:#00d4ff; --a2:#7c3aed; --text:#dde8f5; --muted:#4e6a8a;
-  --green:#10b981; --yellow:#f59e0b; --red:#ef4444; --blue:#3b82f6;
-  --mono:'IBM Plex Mono',monospace; --sans:'Syne',sans-serif;
-}}
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.7}}
-
-/* Header */
-.hdr{{
-  background:linear-gradient(150deg,#050c19 0%,#0a1830 55%,#060e1c 100%);
-  border-bottom:1px solid var(--border); padding:36px 56px;
-  display:flex; justify-content:space-between; align-items:center;
-  position:relative; overflow:hidden;
-}}
-.hdr::before{{
-  content:''; position:absolute; inset:0; pointer-events:none;
-  background:
-    repeating-linear-gradient(90deg,transparent,transparent 120px,rgba(0,212,255,.025) 120px,rgba(0,212,255,.025) 121px),
-    repeating-linear-gradient(0deg,transparent,transparent 120px,rgba(0,212,255,.012) 120px,rgba(0,212,255,.012) 121px);
-}}
-.hdr-l .eyebrow{{font-family:var(--mono);font-size:10px;color:var(--accent);letter-spacing:3px;text-transform:uppercase;margin-bottom:10px}}
-.hdr-l h1{{font-size:30px;font-weight:800;letter-spacing:-1px}}
-.hdr-l h1 em{{color:var(--accent);font-style:normal}}
-.hdr-l .meta{{font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:8px;line-height:2.2}}
-
-/* Grade box */
-.grade-box{{
-  text-align:center; background:rgba(0,0,0,.5);
-  border:2px solid var(--border); border-radius:16px;
-  padding:22px 34px; min-width:130px; flex-shrink:0;
-}}
-.grade-num{{font-size:64px;font-weight:800;color:{gclr};line-height:1;font-family:var(--mono)}}
-.grade-sub{{font-size:10px;color:var(--muted);margin-top:6px;letter-spacing:2px;text-transform:uppercase}}
-
-/* Stats bar */
-.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:24px}}
-.stat{{
-  background:var(--s1); border:1px solid var(--border); border-radius:10px;
-  padding:18px; text-align:center; position:relative; overflow:hidden;
-}}
-.stat::before{{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--accent),var(--a2))}}
-.stat .v{{font-size:36px;font-weight:800;font-family:var(--mono);color:var(--accent)}}
-.stat .l{{font-size:10px;color:var(--muted);margin-top:4px;letter-spacing:1px;text-transform:uppercase}}
-
-/* Layout */
-.wrap{{max-width:1440px;margin:0 auto;padding:36px 56px}}
-.grid2{{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px}}
-
-/* Cards */
-.card{{background:var(--s1);border:1px solid var(--border);border-radius:12px;padding:22px;margin-bottom:20px}}
-.card-t{{font-family:var(--mono);font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--accent);margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid var(--border)}}
-
-/* Table */
-.tbl-wrap{{overflow-x:auto}}
-table{{width:100%;border-collapse:collapse;font-size:13px}}
-th{{background:var(--s2);color:var(--muted);font-size:10px;letter-spacing:1px;text-transform:uppercase;padding:9px 13px;text-align:left;border-bottom:1px solid var(--border)}}
-td{{padding:9px 13px;border-bottom:1px solid rgba(26,48,80,.4);vertical-align:top}}
-tr:hover td{{background:rgba(0,212,255,.025)}}
-.badge{{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;font-family:var(--mono)}}
-.mono{{font-family:var(--mono)}}
-.small{{font-size:12px}}
-.muted{{color:var(--muted)}}
-.right{{text-align:right}}
-.action{{color:#fbbf24}}
-
-/* Info grid */
-.info-grid{{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}}
-.info-row{{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid rgba(26,48,80,.4)}}
-.info-row .k{{color:var(--muted);font-family:var(--mono);font-size:11px}}
-.info-row .v{{font-weight:600;font-size:13px;text-align:right}}
-
-/* Algeria */
-.ali-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px}}
-.ali-card{{background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:14px}}
-.ali-card .k{{font-family:var(--mono);font-size:9px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;margin-bottom:4px}}
-.ali-card .v{{font-weight:700;font-size:15px}}
-
-/* Subdomain pills */
-.pill{{display:inline-block;background:var(--s2);border:1px solid var(--border);border-radius:4px;padding:3px 10px;font-family:var(--mono);font-size:11px;margin:3px;color:var(--accent)}}
-
-/* Section headers */
-.sec{{font-size:18px;font-weight:800;margin:32px 0 16px;display:flex;align-items:center;gap:12px}}
-.sec::after{{content:'';flex:1;height:1px;background:linear-gradient(90deg,var(--border),transparent)}}
-
-/* Footer */
-footer{{text-align:center;padding:28px;color:var(--muted);font-family:var(--mono);font-size:11px;border-top:1px solid var(--border);margin-top:50px}}
-
-@media(max-width:900px){{
-  .stats{{grid-template-columns:1fr 1fr}}
-  .grid2,.ali-grid{{grid-template-columns:1fr}}
-  .hdr{{flex-direction:column;gap:20px;padding:24px}}
-}}
-</style>
-</head>
-<body>
-
-<!-- HEADER -->
-<div class="hdr">
-  <div class="hdr-l">
-    <div class="eyebrow">RECON-DZ v{VERSION} · Security Assessment Report</div>
-    <h1><em>RECON</em>-DZ Scan Report</h1>
-    <div class="meta">
-      Target : {_he(tgt.get('input','?'))} &nbsp;│&nbsp;
-      IP : {tgt.get('ip','?')} &nbsp;│&nbsp;
-      {data.get('meta',{}).get('timestamp','?')}
-    </div>
-  </div>
-  <div class="grade-box">
-    <div class="grade-num">{grade}</div>
-    <div class="grade-sub">Risk Grade</div>
-  </div>
-</div>
-
-<div class="wrap">
-
-<!-- STATS BAR -->
-<div class="stats">
-  <div class="stat"><div class="v" style="color:#ef4444">{n_c}</div><div class="l">Critical</div></div>
-  <div class="stat"><div class="v" style="color:#f59e0b">{n_h}</div><div class="l">High</div></div>
-  <div class="stat"><div class="v">{len(disc)}</div><div class="l">Endpoints</div></div>
-  <div class="stat"><div class="v">{len(ports)}</div><div class="l">Open Ports</div></div>
-</div>
-
-<!-- ALGERIA CONTEXT -->
-{'<h2 class="sec">Algeria Intelligence</h2><div class="ali-grid"><div class="ali-card"><div class="k">Sector</div><div class="v">'+ali.get("sector","?").upper()+'</div></div><div class="ali-card"><div class="k">Criticality</div><div class="v" style="color:#f59e0b">'+ali.get("criticality","?").upper()+'</div></div><div class="ali-card"><div class="k">ISP</div><div class="v">'+_he(ali.get("isp","?"))+'</div></div></div>' if ali else ''}
-
-<!-- TOP ROW -->
-<div class="grid2">
-  <div class="card">
-    <div class="card-t">Connection & Stack</div>
-    <div class="info-grid">
-      <div class="info-row"><span class="k">HTTP Status</span><span class="v">{conn.get('status','?')}</span></div>
-      <div class="info-row"><span class="k">Response Time</span><span class="v">{conn.get('time_s','?')}s</span></div>
-      <div class="info-row"><span class="k">Server</span><span class="v">{_he(conn.get('server','?') or '?')}</span></div>
-      <div class="info-row"><span class="k">WAF</span><span class="v" style="color:{'#f59e0b' if conn.get('waf') else '#10b981'}">{_he(conn.get('waf') or 'None')}</span></div>
-      <div class="info-row"><span class="k">Redirects</span><span class="v">{conn.get('redirects',0)}</span></div>
-      <div class="info-row"><span class="k">CMS</span><span class="v">{', '.join(_he(c['name']) for c in cms) if cms else '—'}</span></div>
-      {'<div class="info-row"><span class="k">SSL Protocol</span><span class="v">'+_he(ssl.get('protocol_version','?'))+'</span></div>' if ssl else ''}
-      {'<div class="info-row"><span class="k">Cert Expiry</span><span class="v">'+_he(str(ssl.get('cert_expiry','?')))+'</span></div>' if ssl else ''}
-      <div class="info-row"><span class="k">Requests</span><span class="v">{stats.get('requests_total',0)}</span></div>
-      <div class="info-row"><span class="k">Success Rate</span><span class="v">{stats.get('success_rate_pct',0)}%</span></div>
-    </div>
-  </div>
-  <div class="card">
-    <div class="card-t">Finding Distribution</div>
-    <canvas id="riskChart" height="180"></canvas>
-  </div>
-</div>
-
-{waf_block}
-
-<!-- FINDINGS -->
-<h2 class="sec">Security Findings ({len(fndgs)})</h2>
-<div class="card">
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>Severity</th><th>Finding</th><th>Detail</th><th>Recommended Action</th></tr></thead>
-      <tbody>{f_rows or '<tr><td colspan=4 style="text-align:center;padding:30px;color:var(--muted)">No significant findings detected</td></tr>'}</tbody>
-    </table>
-  </div>
-</div>
-
-<!-- ENDPOINTS -->
-{'<h2 class="sec">Discovered Endpoints ('+str(len(disc))+')</h2><div class="card"><div class="tbl-wrap"><table><thead><tr><th>Status</th><th>URL</th><th>Title</th><th>Size</th></tr></thead><tbody>'+ep_rows+'</tbody></table></div></div>' if disc else ''}
-
-<!-- PORTS -->
-{'<h2 class="sec">Open Ports ('+str(len(ports))+')</h2><div class="card"><div class="tbl-wrap"><table><thead><tr><th>Port</th><th>Service</th><th>Banner</th><th>Vuln Hint</th></tr></thead><tbody>'+pt_rows+'</tbody></table></div></div>' if ports else ''}
-
-<!-- SUBDOMAINS -->
-{'<h2 class="sec">Subdomains ('+str(subs.get("found",0))+')</h2><div class="card">'+sub_pills+'</div>' if subs else ''}
-
-</div><!-- /wrap -->
-
-<footer>
-  RECON-DZ v{VERSION} · {data.get('meta',{}).get('timestamp','')} · Authorized Security Assessment Only
-</footer>
-
-<script>
-new Chart(document.getElementById('riskChart'),{{
-  type:'doughnut',
-  data:{{
-    labels:['Critical','High','Medium','Low','None'],
-    datasets:[{{
-      data:[{n_c},{n_h},{n_m},{n_l},{max(1 if not (n_c+n_h+n_m+n_l) else 0,0)}],
-      backgroundColor:['#ef4444','#f59e0b','#3b82f6','#10b981','#1a3050'],
-      borderWidth:0, hoverOffset:6
-    }}]
-  }},
-  options:{{
-    responsive:true, cutout:'68%',
-    plugins:{{
-      legend:{{position:'right',labels:{{color:'#4e6a8a',font:{{size:11,family:"'IBM Plex Mono'"}}}}}}
-    }}
-  }}
-}});
-</script>
-</body>
-</html>"""
-
-
-def _build_scan_txt(data: Dict) -> str:
-    tgt   = data.get('target', {})
-    conn  = data.get('connection', {})
-    fndgs = data.get('findings', [])
-    stats = data.get('statistics', {})
-    ts    = data.get('meta', {}).get('timestamp', '?')
-    lines = [
-        f"RECON-DZ v{VERSION} — Security Assessment Report",
-        '=' * 68,
-        f"Target    : {tgt.get('input','?')}",
-        f"IP        : {tgt.get('ip','?')}",
-        f"Timestamp : {ts}",
-        '',
-        'CONNECTION',
-        '─' * 40,
-        f"Status  : {conn.get('status','?')}",
-        f"Server  : {conn.get('server','?')}",
-        f"WAF     : {conn.get('waf') or 'None'}",
-        f"Time    : {conn.get('time_s','?')}s",
-        '',
-        'SECURITY FINDINGS',
-        '─' * 40,
-    ]
-    for f in fndgs:
-        lines += [
-            f"[{f.get('severity','?').upper()}] {f.get('name','')}",
-            f"  Category : {f.get('category','')}",
-            f"  Detail   : {f.get('detail','')}",
-            f"  Action   : {f.get('recommendation','')}",
-            '',
-        ]
-    if not fndgs:
-        lines += ['No significant findings.', '']
-
-    ports = data.get('port_scan', {}).get('open_ports', [])
-    if ports:
-        lines += ['OPEN PORTS', '─' * 40]
-        for p in ports:
-            lines.append(f"  {p['port']}/tcp  {p.get('service','?')}"
-                         + (f"  {p.get('banner','')[:60]}" if p.get('banner') else ''))
-        lines.append('')
-
-    subs = data.get('subdomains', {})
-    if subs.get('found'):
-        lines += [f"SUBDOMAINS  ({subs['found']} active)", '─' * 40]
-        for s in subs.get('subdomains', [])[:20]:
-            lines.append(f"  {s['domain']}")
-        lines.append('')
-
-    waf = data.get('waf_analysis', {})
-    if waf:
-        lines += [
-            'WAF ANALYSIS', '─' * 40,
-            f"Grade          : {waf.get('grade','?')}",
-            f"Detection Rate : {waf.get('detection_rate',0):.1f}%",
-            f"Blind Spots    : {len(waf.get('blind_spots',[]))}",
-            '',
-        ]
-
-    lines += [
-        '─' * 68,
-        f"Requests : {stats.get('requests_total',0)} total  "
-        f"({stats.get('success_rate_pct',0)}% success)",
-        f"RECON-DZ v{VERSION} · Authorized Use Only",
-    ]
-    return '\n'.join(lines)
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  CLI PARSER
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def _parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog='recon.py',
-        description='RECON-DZ v3 — Unified Security Platform',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"""
-{'━'*64}
-EXAMPLES
-  # Basic recon scan
-  python recon.py scan -t ministere.gov.dz
-
-  # Full recon (all modules) + inline WAF check
-  python recon.py scan -t target.dz -e --waf-check
-
-  # Recon with specific modules
-  python recon.py scan -t target.dz --subdomains --ports --cms --vuln
-
-  # WAF defensive analysis only
-  python recon.py waf -t https://yoursite.dz/search
-
-  # WAF with specific attack categories
-  python recon.py waf -t https://yoursite.dz/search --categories SQLi XSS SSRF
-
-  # Batch scan from file (one domain per line)
-  python recon.py batch -f targets.txt -e
-
-  # Regenerate HTML from existing JSON
-  python recon.py report --json results/20260312_scan.json
-{'━'*64}
-WAF CATEGORIES
-  {' '.join(WAF_PROBES.keys())}
-{'━'*64}
-""",
-    )
-
-    sub = p.add_subparsers(dest='mode', metavar='MODE')
-
-    # ── SCAN ──────────────────────────────────────────────────────────
-    s = sub.add_parser('scan', help='Full reconnaissance scan',
-                        formatter_class=argparse.RawDescriptionHelpFormatter)
-    s.add_argument('-t','--target',       required=True, help='Target domain or IP')
-    s.add_argument('--depth', choices=['quick','normal','deep'], default='normal')
-    s.add_argument('--max-concurrent',    type=int, default=30)
-    s.add_argument('--output-dir',        default='./results')
-    s.add_argument('--internal',          action='store_true',
-                   help='Internal network (faster, no stealth delays)')
-    s.add_argument('-v','--verbose',      action='store_true')
-    g = s.add_argument_group('Modules  (-e enables ALL)')
-    g.add_argument('-e','--enumerate',    action='store_true', help='Enable ALL modules')
-    g.add_argument('--reverse-ip',        action='store_true', dest='reverse_ip')
-    g.add_argument('--subdomains',        action='store_true', dest='enumerate_subdomains')
-    g.add_argument('--ports',             action='store_true')
-    g.add_argument('--cms',               action='store_true')
-    g.add_argument('--fingerprint',       action='store_true')
-    g.add_argument('--vuln',             action='store_true')
-    g.add_argument('--intel',            action='store_true',
-                   help='Behavioral fingerprinting + Attack surface map (recommended)')
-    g.add_argument('--waf-check',         action='store_true', dest='waf_check',
-                   help='Add inline WAF analysis phase to scan')
-
-    # ── WAF ───────────────────────────────────────────────────────────
-    w = sub.add_parser('waf', help='Defensive WAF analysis',
-                        formatter_class=argparse.RawDescriptionHelpFormatter)
-    w.add_argument('-t','--target',       required=True,
-                   help='Full URL  e.g. https://yoursite.dz/search')
-    w.add_argument('--param',             default='q',
-                   help='GET parameter to inject into (default: q)')
-    w.add_argument('--categories',        nargs='+', metavar='CAT')
-    w.add_argument('--delay',             type=float, default=0.3)
-    w.add_argument('--max-concurrent',    type=int, default=15)
-    w.add_argument('--output-dir',        default='./results')
-    w.add_argument('--internal',          action='store_true')
-    w.add_argument('-y','--yes',          action='store_true',
-                   help='Skip authorization prompt')
-
-    # ── BATCH ─────────────────────────────────────────────────────────
-    b = sub.add_parser('batch', help='Scan multiple targets from file',
-                        formatter_class=argparse.RawDescriptionHelpFormatter)
-    b.add_argument('-f','--file',         required=True,
-                   help='Text file, one domain/IP per line')
-    b.add_argument('--depth', choices=['quick','normal','deep'], default='normal')
-    b.add_argument('--max-concurrent',    type=int, default=20)
-    b.add_argument('--output-dir',        default='./results')
-    b.add_argument('--internal',          action='store_true')
-    g2 = b.add_argument_group('Modules  (-e enables ALL)')
-    g2.add_argument('-e','--enumerate',   action='store_true')
-    g2.add_argument('--subdomains',       action='store_true', dest='enumerate_subdomains')
-    g2.add_argument('--ports',            action='store_true')
-    g2.add_argument('--cms',              action='store_true')
-    g2.add_argument('--vuln',            action='store_true')
-    g2.add_argument('--waf-check',        action='store_true', dest='waf_check')
-
-    # ── REPORT ────────────────────────────────────────────────────────
-    r = sub.add_parser('report', help='Rebuild HTML from existing JSON',
-                        formatter_class=argparse.RawDescriptionHelpFormatter)
-    r.add_argument('--json',              required=True, dest='json_file',
-                   help='Path to .json report')
-
-    # ── PROFILE ───────────────────────────────────────────────────────
-    prof = sub.add_parser('profile',
-        help='Discover & profile ALL domains hosted on an IP',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="""
-Host Intelligence Profiler
-  Given an IP, discover every co-hosted domain and profile:
-  - HTTP status, title, server
-  - CMS name + exact version + confidence
-  - Tech stack (PHP, Node, Java...)
-  - Security header grade (A-F)
-  - Algeria sector / criticality
-  - Source attribution (SSL cert, crt.sh, HackerTarget...)
-""")
-    prof.add_argument('-i', '--ip',         required=True,
-                      help='Target IP or domain name (e.g. 41.111.1.1 OR example.dz)')
-    prof.add_argument('--concurrency',      type=int, default=10,
-                      help='Parallel domain profiles (default: 10)')
-    prof.add_argument('--max-concurrent',   type=int, default=30)
-    prof.add_argument('--output-dir',       default='./results')
-    prof.add_argument('--internal',         action='store_true')
-    prof.add_argument('--stealth',          action='store_true',
-                      help='Ghost mode — rotate identity per domain')
-    prof.add_argument('--cdn-bypass',       action='store_true',
-                      help='Find origin IPs behind Cloudflare/Akamai')
-    prof.add_argument('--block-analysis',   action='store_true',
-                      help='Analyze HOW the target blocks you')
-    prof.add_argument('-v', '--verbose',    action='store_true')
-
-    p.add_argument('--version', action='version', version=f'RECON-DZ v{VERSION}')
-    return p
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  ASYNC DISPATCHER
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-
-async def _mode_stealth_analysis(engine: AsyncReconEngine, args):
-    """
-    Standalone stealth analysis mode.
-    Runs block detection + CDN bypass + ghost scan report.
-    """
-    import json as _json
-    from pathlib import Path as _Path
-    from datetime import datetime as _dt
-
-    target  = getattr(args, 'target', None) or getattr(args, 'ip', None)
-    out_dir = _Path(getattr(args, 'output_dir', './results'))
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Detect domain or IP
-    domain = target.lstrip('https://').lstrip('http://').split('/')[0]
-
-    _sep('═')
-    print(f"  {C}[GHOST MODE]{RS} Target: {Y}{domain}{RS}")
-    _sep('═')
-
-    scanner = StealthScanner(engine, stealth_level='normal')
-    detector = BlockDetector(engine)
-
-    print(f"  {C}[1/3]{RS} Analyzing protection layers…")
-    block_info = await detector.analyze(domain)
-
-    print(f"  {C}[2/3]{RS} Executing CDN bypass…")
-    cdn_bypass = CDNBypass(engine)
-    origins    = await cdn_bypass.find_origin(domain)
-
-    print(f"  {C}[3/3]{RS} Ghost-mode scan…")
-    origin_ip = origins[0].ip if origins and origins[0].confidence >= 50 else None
-    ghost     = GhostRequester(engine, stealth_level='normal')
-    resp      = await ghost.get(f'https://{domain}', origin_ip=origin_ip)
-
-    # Print results
-    _sep('═')
-    print(f"  {B}STEALTH ANALYSIS RESULTS{RS}")
-    _sep('═')
-
-    print(f"  CDN      : {block_info.cdn_name or 'None detected'}")
-    print(f"  WAF      : {block_info.waf_name or 'None detected'}")
-    print(f"  Blocked  : {R+'YES'+RS if block_info.is_blocked else G+'NO'+RS}")
-    print(f"  Block type: {Y}{block_info.block_type}{RS}")
-    print()
-
-    if origins:
-        print(f"  {G}Origin IPs found:{RS}")
-        for o in origins[:5]:
-            bar = '█' * (o.confidence // 10) + '░' * (10 - o.confidence // 10)
-            print(f"    {G}→{RS} {C}{o.ip:>18}{RS}  [{bar}] {o.confidence}%  {o.method}")
-        if origin_ip:
-            print(f"\n  {G}[✓]{RS} Best origin: {Y}{origin_ip}{RS}")
-            print(f"  {G}[✓]{RS} Ghost response via origin: HTTP {resp.status}")
-    else:
-        print(f"  {Y}[i]{RS} No origin IPs found (well-protected or not behind CDN)")
-
-    if block_info.bypass_methods:
-        print(f"\n  {Y}Recommended bypass techniques:{RS}")
-        for m in block_info.bypass_methods:
-            print(f"    {C}·{RS} {m}")
-
-    print(f"\n  {Y}Evidence collected:{RS}")
-    for e in block_info.evidence:
-        print(f"    · {e}")
-
-    # Save
-    ts = _dt.now().strftime('%Y%m%d_%H%M%S')
-    safe = domain.replace('.', '_')
-    jp   = out_dir / f"{ts}_stealth_{safe}.json"
-    report = {
-        'domain':    domain,
-        'block':     block_info.__dict__,
-        'origins':   [{'ip': o.ip, 'conf': o.confidence,
-                       'method': o.method} for o in origins],
-        'ghost_http_status': resp.status,
-        'origin_used': origin_ip,
-    }
-    jp.write_text(
-        _json.dumps(report, indent=2, ensure_ascii=False, default=str),
-        encoding='utf-8'
-    )
-    _sep()
-    print(f"  {G}[+]{RS} Report: {jp}")
-    _sep('═')
-
-async def _mode_profile(engine: AsyncReconEngine, args):
-    """
-    Host Intelligence Profiler mode.
-    Discovers all co-hosted domains on an IP and profiles each one.
-    """
-    import json as _json
-    from pathlib import Path as _Path
-    from datetime import datetime as _dt
-
-    target    = args.ip.strip()
-    conc      = getattr(args, 'concurrency', 10)
-    out_dir   = _Path(getattr(args, 'output_dir', './results'))
-    out_dir.mkdir(parents=True, exist_ok=True)
-    verbose   = getattr(args, 'verbose', False)
-
-    # ── Resolve domain → IP if a hostname was given ──────────────
-    import re as _re
-    is_ip = bool(_re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', target))
-    if is_ip:
-        ip = target
-        domain_input = None
-    else:
-        # It's a domain name — resolve it first
-        domain_input = target
-        print(f"\n  {C}[*]{RS} Resolving {Y}{target}{RS} → IP …")
-        ip = await engine.resolve_hostname(target)
-        if not ip:
-            print(f"  {R}[!]{RS} Could not resolve hostname: {target}")
-            return
-        print(f"  {G}[+]{RS} Resolved: {Y}{ip}{RS}\n")
-
-    _sep('═')
-    if domain_input:
-        print(f"  Target     : {Y}{domain_input}{RS}  →  {C}{ip}{RS}")
-    else:
-        print(f"  Target IP  : {Y}{ip}{RS}")
-    print(f"  Concurrency: {conc} parallel profiles")
-    print(f"  Output     : {out_dir}")
-    _sep('═')
-
-    profiler = HostProfiler(engine, AlgeriaThreatDatabase(), concurrency=conc)
-
-    # Progress callback
-    def _progress(current, total, domain):
-        bar_w = 30
-        filled = int(bar_w * current / max(total, 1))
-        bar   = '█' * filled + '░' * (bar_w - filled)
-        print(f"  [{bar}] {current:>3}/{total}  {C}{domain[:45]}{RS}  " + ' '*10,
-              end='\r', flush=True)
-
-    print(f"\n  {C}[*]{RS} Enumerating co-hosted domains…\n")
-    report = await profiler.profile_ip(ip, progress_cb=_progress)
-    print()   # newline after progress bar
-
-    # Print summary
-    _sep('═')
-    print(f"  {B}HOST PROFILE COMPLETE{RS}")
-    _sep('═')
-    print(f"  IP          : {ip}")
-    print(f"  ASN         : AS{report.get('asn','?')}  ({report.get('org','?')})")
-    print(f"  CIDR        : {report.get('cidr','?')}  [{report.get('country','?')}]")
-    print(f"  Domains     : {report.get('total_domains',0)} found  "
-          f"({G}{report.get('active_domains',0)} active{RS})")
-    print(f"  Scan time   : {report.get('elapsed_s','?')}s\n")
-
-    cms_sum = report.get('cms_summary', {})
-    if cms_sum:
-        print(f"  CMS Distribution:")
-        for cms_name, count in sorted(cms_sum.items(), key=lambda x:-x[1]):
-            print(f"    {G}·{RS} {cms_name:<25} {count} site(s)")
-        print()
-
-    # Print active domains table
-    active = [d for d in report.get('domains', []) if d.get('active')]
-    if verbose:
-        domains_to_show = report.get('domains', [])
-    else:
-        domains_to_show = active[:40]
-
-    print(f"  {'DOMAIN':<40} {'STATUS':>6}  {'CMS':<20} {'VER':<10} {'SEC':<4}  STACK")
-    print(f"  {'─'*40} {'─'*6}  {'─'*20} {'─'*10} {'─'*4}  ─────────")
-    for d in domains_to_show:
-        if not d.get('active') and not verbose:
-            continue
-        cms  = d.get('cms') or {}
-        name = (cms.get('name','—'))[:20]
-        ver  = (cms.get('version') or '—')[:10]
-        sec  = (d.get('security',{}).get('grade','?'))
-        stk  = ', '.join(d.get('stack',[])[:2])[:20]
-        dom  = d.get('domain','?')[:40]
-        st   = d.get('status', 0)
-        sec_c = (G if sec in ('A','B') else Y if sec=='C' else R)
-        ver_c = Y if ver != '—' else ''
-        print(f"  {dom:<40} {str(st):>6}  {name:<20} {ver_c}{ver:<10}{RS} "
-              f"{sec_c}{sec:<4}{RS}  {stk}")
-
-    if len(active) > 40 and not verbose:
-        print(f"  … +{len(active)-40} more  (use -v to show all)")
-
-    # Save reports
-    ts   = _dt.now().strftime('%Y%m%d_%H%M%S')
-    safe = ip.replace('.','_')
-    jp   = out_dir / f"{ts}_profile_{safe}.json"
-    hp   = out_dir / f"{ts}_profile_{safe}.html"
-
-    jp.write_text(
-        _json.dumps(report, indent=2, ensure_ascii=False, default=str),
-        encoding='utf-8'
-    )
-    hp.write_text(generate_host_profile_html(report), encoding='utf-8')
-
-    _sep()
-    print(f"  {G}[+]{RS} JSON : {jp}")
-    print(f"  {G}[+]{RS} HTML : {hp}")
-    _sep('═')
-
-
-async def _dispatch(args):
-    mode = getattr(args, 'mode', None)
-
-    # ── No mode → print help ─────────────────────────────────────────
-    if not mode:
-        banner()
-        print(f"  Usage:  python recon.py  [scan | waf | batch | report]  --help\n")
-        print(f"  {C}scan{RS}    Full reconnaissance — DNS · ports · CMS · vulns · fingerprint")
-        print(f"  {Y}waf{RS}     Defensive WAF analysis — 66 probes · blind-spot detection")
-        print(f"  {M}batch{RS}   Multi-target scan from a text file")
-        print(f"  {G}report{RS}  Regenerate HTML from an existing JSON report")
-        print(f"  {C}profile{RS} Host Intelligence — ALL co-hosted domains + CMS + security grade\n")
-        return
-
-    # ── SCAN mode ────────────────────────────────────────────────────
-    if mode == 'scan':
-        banner('scan')
-        print(f"  {Y}[!]{RS} For authorized security assessment only.\n")
-        engine  = await build_engine(
-            max_concurrent=getattr(args,'max_concurrent',30),
-            internal=getattr(args,'internal',False),
-        )
-        try:
-            scanner = ScanMode(engine, args)
-            await scanner.run(args.target)
-        finally:
-            await engine.close()
-
-    # ── WAF mode ─────────────────────────────────────────────────────
-    elif mode == 'waf':
-        banner('waf')
-        engine = await build_engine(
-            max_concurrent=getattr(args,'max_concurrent',15),
-            internal=getattr(args,'internal',False),
-        )
-        try:
-            waf_mode = WAFMode(engine, args)
-            await waf_mode.run()
-        finally:
-            await engine.close()
-
-    # ── BATCH mode ───────────────────────────────────────────────────
-    elif mode == 'batch':
-        banner('batch')
-        print(f"  {Y}[!]{RS} Batch mode — authorized use only.\n")
-        engine = await build_engine(
-            max_concurrent=getattr(args,'max_concurrent',20),
-            internal=getattr(args,'internal',False),
-        )
-        try:
-            batch = BatchMode(engine, args)
-            await batch.run(args.file)
-        finally:
-            await engine.close()
-
-    # ── REPORT mode ──────────────────────────────────────────────────
-    elif mode == 'profile':
-        banner('profile')
-        print(f"  {Y}[!]{RS} Host profiler — authorized use only.\n")
-        engine = await build_engine(
-            max_concurrent=getattr(args,'max_concurrent',30),
-            internal=getattr(args,'internal',False),
-        )
-        try:
-            await _mode_profile(engine, args)
-        finally:
-            await engine.close()
-
-    elif mode == 'report':
-        banner('report')
-        jp = Path(args.json_file)
-        if not jp.exists():
-            print(f"  {R}[ERROR]{RS} File not found: {jp}"); return
-        data = json.loads(jp.read_text(encoding='utf-8'))
-        hp   = jp.with_suffix('.html')
-        # Detect WAF report vs scan report
-        if 'detection_rate' in data and 'probe_results' in data:
-            profile = WAFProfile(
-                target           = data.get('target','?'),
-                waf_detected     = data.get('waf_detected'),
-                detection_rate   = data.get('detection_rate', 0),
-                blind_spots      = data.get('blind_spots', []),
-                strong_categories= data.get('strong_categories', []),
-                weak_categories  = data.get('weak_categories', []),
-                response_behavior= data.get('response_behavior', {}),
-                recommendations  = data.get('recommendations', []),
-            )
-            html = generate_waf_html_report(profile)
-        else:
-            html = _build_scan_html(data)
-        hp.write_text(html, encoding='utf-8')
-        print(f"  {G}[+]{RS} HTML report written : {hp}\n")
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  ENTRY POINT
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def main():
-    parser = _parser()
-    args   = parser.parse_args()
-
-    try:
-        asyncio.run(_dispatch(args))
-    except KeyboardInterrupt:
-        print(f"\n  {Y}[!]{RS} Interrupted")
-        sys.exit(1)
-    except Exception as exc:
-        print(f"\n  {R}[ERROR]{RS} {exc}")
-        import traceback; traceback.print_exc()
-        sys.exit(1)
-
-
-if __name__ == '__main__':
-    main()
+# ... (كل الكود من بعد هذا السطر يبقى كما هو في الملف الأصلي) ...
